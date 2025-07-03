@@ -1,0 +1,23 @@
+﻿component,label,type,scenario,value
+module,Module,hard,baseline,0.61
+inverter,Inverter,hard,baseline,0.49
+sbos,SBOS,hard,baseline,0.17
+ebos,EBOS,hard,baseline,0.4
+cust_aq,Customer acquisition,soft,baseline,0.49
+cust_care,Customer care,soft,baseline,0.21
+design,Design and engineering,soft,baseline,0.06
+site_visit,Site visits,soft,baseline,0.06
+overhead,Overhead,soft,baseline,0.66
+pii,PII,soft,baseline,0.11
+installation,Installation,soft,baseline,0.44
+module,Module,hard,policy,0.61
+inverter,Inverter,hard,policy,0.49
+sbos,SBOS,hard,policy,0.17
+ebos,EBOS,hard,policy,0.4
+cust_aq,Customer acquisition,soft,policy,0.32
+cust_care,Customer care,soft,policy,0.14
+design,Design and engineering,soft,policy,0.01
+site_visit,Site visits,soft,policy,0.05
+overhead,Overhead,soft,policy,0.37
+pii,PII,soft,policy,0.08
+installation,Installation,soft,policy,0.44
