@@ -1,0 +1,24 @@
+[tool.poetry]
+name = "ad-hoc"
+version = "0.1.0"
+description = "Ad-hoc analyses for Permit Power"
+authors = ["Talor Gruenwald"]
+license = "Apache 2.0"
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = ">=3.13"
+pandas = ">=2.3.0,<3.0.0"
+nrel-pysam = "^7.0.0"
+matplotlib = "^3.10.3"
+seaborn = "^0.13.2"
+plotly = "^6.1.2"
+numpy = "^2.3.1"
+
+[tool.poetry.group.dev.dependencies]
+ipykernel = "^6.29.5"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
