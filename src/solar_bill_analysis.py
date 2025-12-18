@@ -45,7 +45,7 @@ import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Any
 
 import duckdb
 import matplotlib.pyplot as plt
@@ -1201,115 +1201,78 @@ def compute_bills_for_buildings(
     metadata_id_col: str = "bldg_id",
 ) -> pd.DataFrame:
     """
-    Compute annual bills and bill savings for baseline, heat pump-only,
-    and heat pump+PV for a set of buildings.
+    Compute annual bills and bill savings for baseline, solar-only,
+    heat pump-only, and heat pump+PV for a set of buildings.
 
-    The function expects:
+    Cases
+    -----
+    1) Baseline (Upgrade 0):
+       - bill_baseline
 
-    - hourly_df: output of build_building_hourly_profiles with columns:
-        * bldg_id
-        * upgrade
-        * ts_hour
-        * elec_kwh
-        * gas_kwh
-        * in.city
-        * in.state
-        * in.county
+    2) Solar only (Upgrade 0 + PV):
+       - bill_solar_only
+       - savings_solar_only = bill_baseline - bill_solar_only
 
-    - metadata_df: ResStock metadata with at least:
-        * metadata_id_col (e.g. "bldg_id")
-        * in.utility_bill_electricity_fixed_charges        ( $/month )
-        * in.utility_bill_electricity_marginal_rates       ( $/kWh )
-        * in.utility_bill_natural_gas_fixed_charges        ( $/month )
-        * in.utility_bill_natural_gas_marginal_rates       ( $/kWh )
+    3) Heat pump only (Upgrade 7):
+       - bill_hp
+       - savings_hp = bill_baseline - bill_hp
 
-    - pv_df: hourly PV generation (kWh) per building with columns:
-        * bldg_id
-        * ts_hour
-        * pv_kwh
+    4) Heat pump + PV (Upgrade 7 + PV):
+       - bill_hp_pv
+       - savings_hp_pv = bill_baseline - bill_hp_pv
 
-    For each building ID, the function computes three annual bill cases:
+    Notes
+    -----
+    - PV is applied to electricity only via hourly netting:
+        net_elec_kwh  = max(load_kwh - pv_kwh, 0)
+        export_kwh    = max(pv_kwh - load_kwh, 0)
 
-        1. Baseline (upgrade baseline_upgrade, e.g. "0"):
-            - bill_ele_0, bill_gas_0, bill_total_0
-
-        2. Heat pump only (upgrade hp_upgrade, e.g. "7"):
-            - bill_ele_7, bill_gas_7, bill_total_7
-
-        3. Heat pump + PV:
-            - bill_ele_7_pv, bill_gas_7_pv, bill_total_7_pv
-
-           where HP+PV uses:
-               * net electric consumption (HP load minus PV self-consumption)
-               * annual PV exports valued at export_rate_per_kwh ($/kWh)
-
-    The output DataFrame includes, per building:
-
-        - bldg_id
-        - in.city
-        - in.state
-        - in.county
-        - bill_baseline
-        - bill_hp
-        - bill_hp_pv
-        - savings_hp         = bill_baseline - bill_hp
-        - savings_hp_pv      = bill_baseline - bill_hp_pv
-        - annual_elec_0_kwh
-        - annual_elec_7_kwh
-        - annual_elec_7_net_kwh
-        - annual_gas_0_kwh
-        - annual_gas_7_kwh
-        - annual_exports_kwh
+    - Gas rates in ResStock metadata are in $/therm and are converted
+      internally to $/kWh using 1 therm = 29.3 kWh.
 
     Parameters
     ----------
     hourly_df : pandas.DataFrame
-        Building-level hourly profiles from build_building_hourly_profiles.
+        Output of build_building_hourly_profiles.
     metadata_df : pandas.DataFrame
-        Metadata table with building tariffs and other fields.
+        ResStock metadata including tariff columns.
     pv_df : pandas.DataFrame
         Hourly PV generation with columns ['bldg_id', 'ts_hour', 'pv_kwh'].
+        (May also include 'system_kw' or other columns; they are ignored.)
     export_rate_per_kwh : float, optional
-        Credit rate for exported PV energy in $/kWh. Defaults to 0.0.
+        Export credit rate ($/kWh) applied to annual exports.
     baseline_upgrade : str, optional
-        Upgrade label for the baseline scenario. Default "0".
+        Baseline upgrade label, default "0".
     hp_upgrade : str, optional
-        Upgrade label for the heat pump scenario. Default "7".
+        Heat pump upgrade label, default "7".
     metadata_id_col : str, optional
-        Column in metadata_df that corresponds to bldg_id in hourly_df.
+        Column in metadata_df corresponding to bldg_id.
 
     Returns
     -------
     pandas.DataFrame
-        Per-building bills and savings as described above.
+        Per-building bills and savings including solar-only metrics.
     """
-    # ------------------------------------------------------------------
-    # Normalize dtypes and avoid mutating caller data
-    # ------------------------------------------------------------------
     hourly_df = hourly_df.copy()
     metadata_df = metadata_df.copy()
     pv_df = pv_df.copy()
 
-    # Ensure IDs are strings everywhere
+    # Ensure IDs are strings
     hourly_df["bldg_id"] = hourly_df["bldg_id"].astype(str)
     pv_df["bldg_id"] = pv_df["bldg_id"].astype(str)
     metadata_df[metadata_id_col] = metadata_df[metadata_id_col].astype(str)
 
-    # Ensure ts_hour is datetime in both hourly and PV data
+    # Ensure ts_hour is datetime for merges
     if "ts_hour" in hourly_df.columns:
         hourly_df["ts_hour"] = pd.to_datetime(hourly_df["ts_hour"])
     if "ts_hour" in pv_df.columns:
         pv_df["ts_hour"] = pd.to_datetime(pv_df["ts_hour"])
 
-    # ------------------------------------------------------------------
-    # Split hourly profiles into baseline and HP cases
-    # ------------------------------------------------------------------
+    # Split hourly profiles
     hourly_baseline = hourly_df[hourly_df["upgrade"] == baseline_upgrade]
     hourly_hp = hourly_df[hourly_df["upgrade"] == hp_upgrade]
 
-    # ------------------------------------------------------------------
-    # Pre-aggregate to annual energy for baseline and HP
-    # ------------------------------------------------------------------
+    # Annual baseline and HP energy
     agg_baseline = (
         hourly_baseline.groupby("bldg_id")
         .agg(
@@ -1331,13 +1294,33 @@ def compute_bills_for_buildings(
         .reset_index()
     )
 
-    # Merge baseline and HP aggregates
     annual = pd.merge(agg_baseline, agg_hp, on="bldg_id", how="inner")
 
-    # ------------------------------------------------------------------
-    # Build HP + PV hourly net load and exports
-    # ------------------------------------------------------------------
-    # Merge HP hourly load with PV hourly generation
+    # ---- Solar-only (baseline + PV) hourly netting ----
+    base_with_pv = pd.merge(
+        hourly_baseline[["bldg_id", "ts_hour", "elec_kwh"]],
+        pv_df[["bldg_id", "ts_hour", "pv_kwh"]],
+        on=["bldg_id", "ts_hour"],
+        how="left",
+    )
+    base_with_pv["pv_kwh"] = base_with_pv["pv_kwh"].fillna(0.0)
+
+    base_with_pv["net_elec_kwh"] = (base_with_pv["elec_kwh"] - base_with_pv["pv_kwh"]).clip(lower=0.0)
+    base_with_pv["export_kwh"] = (base_with_pv["pv_kwh"] - base_with_pv["elec_kwh"]).clip(lower=0.0)
+
+    agg_base_pv = (
+        base_with_pv.groupby("bldg_id")
+        .agg(
+            annual_elec_0_net_kwh=("net_elec_kwh", "sum"),
+            annual_exports_0_kwh=("export_kwh", "sum"),
+        )
+        .reset_index()
+    )
+    annual = pd.merge(annual, agg_base_pv, on="bldg_id", how="left")
+    annual["annual_elec_0_net_kwh"] = annual["annual_elec_0_net_kwh"].fillna(annual["annual_elec_0_kwh"])
+    annual["annual_exports_0_kwh"] = annual["annual_exports_0_kwh"].fillna(0.0)
+
+    # ---- HP + PV hourly netting ----
     hp_with_pv = pd.merge(
         hourly_hp[["bldg_id", "ts_hour", "elec_kwh"]],
         pv_df[["bldg_id", "ts_hour", "pv_kwh"]],
@@ -1346,17 +1329,9 @@ def compute_bills_for_buildings(
     )
     hp_with_pv["pv_kwh"] = hp_with_pv["pv_kwh"].fillna(0.0)
 
-    # Net load is HP load minus PV self-consumption, floored at 0
-    hp_with_pv["net_elec_kwh"] = (
-        hp_with_pv["elec_kwh"] - hp_with_pv["pv_kwh"]
-    ).clip(lower=0.0)
+    hp_with_pv["net_elec_kwh"] = (hp_with_pv["elec_kwh"] - hp_with_pv["pv_kwh"]).clip(lower=0.0)
+    hp_with_pv["export_kwh"] = (hp_with_pv["pv_kwh"] - hp_with_pv["elec_kwh"]).clip(lower=0.0)
 
-    # Exports are PV generation in excess of HP load, floored at 0
-    hp_with_pv["export_kwh"] = (
-        hp_with_pv["pv_kwh"] - hp_with_pv["elec_kwh"]
-    ).clip(lower=0.0)
-
-    # Aggregate HP+PV net load and exports to annual values
     agg_hp_pv = (
         hp_with_pv.groupby("bldg_id")
         .agg(
@@ -1366,18 +1341,11 @@ def compute_bills_for_buildings(
         .reset_index()
     )
 
-    # Merge HP+PV aggregates into the annual table
     annual = pd.merge(annual, agg_hp_pv, on="bldg_id", how="left")
-
-    # For buildings without PV, treat net_elec = HP load and exports = 0
-    annual["annual_elec_7_net_kwh"] = annual["annual_elec_7_net_kwh"].fillna(
-        annual["annual_elec_7_kwh"]
-    )
+    annual["annual_elec_7_net_kwh"] = annual["annual_elec_7_net_kwh"].fillna(annual["annual_elec_7_kwh"])
     annual["annual_exports_kwh"] = annual["annual_exports_kwh"].fillna(0.0)
 
-    # ------------------------------------------------------------------
-    # Attach tariff fields from metadata
-    # ------------------------------------------------------------------
+    # Tariffs
     meta_cols = [
         metadata_id_col,
         "in.utility_bill_electricity_fixed_charges",
@@ -1387,46 +1355,39 @@ def compute_bills_for_buildings(
     ]
     missing_meta = [c for c in meta_cols if c not in metadata_df.columns]
     if missing_meta:
-        raise KeyError(
-            f"metadata_df is missing required tariff columns: {missing_meta}"
-        )
+        raise KeyError(f"metadata_df is missing required tariff columns: {missing_meta}")
 
     meta_tariffs = metadata_df[meta_cols].copy()
     meta_tariffs = meta_tariffs.rename(columns={metadata_id_col: "bldg_id"})
     meta_tariffs["bldg_id"] = meta_tariffs["bldg_id"].astype(str)
-
     annual = pd.merge(annual, meta_tariffs, on="bldg_id", how="left")
 
-    # ------------------------------------------------------------------
-    # Compute bills per building
-    # ------------------------------------------------------------------
+    # Bills per building
     records: list[dict[str, Any]] = []
-
     for _, row in annual.iterrows():
         bid = row["bldg_id"]
 
-        elec_fixed = float(
-            row["in.utility_bill_electricity_fixed_charges"]
-        )
-        elec_rate = float(
-            row["in.utility_bill_electricity_marginal_rates"]
-        )
-        gas_fixed = float(
-            row["in.utility_bill_natural_gas_fixed_charges"]
-        )
-        gas_rate_raw = float(row["in.utility_bill_natural_gas_marginal_rates"])
-        # Convert from $/therm → $/kWh
-        gas_rate = gas_rate_raw / 29.3
+        elec_fixed = float(row["in.utility_bill_electricity_fixed_charges"])
+        elec_rate = float(row["in.utility_bill_electricity_marginal_rates"])
 
-        # Annual energy totals
+        gas_fixed = float(row["in.utility_bill_natural_gas_fixed_charges"])
+        gas_rate_therm = float(row["in.utility_bill_natural_gas_marginal_rates"])
+        gas_rate = gas_rate_therm / 29.3  # $/therm -> $/kWh
+
+        # Energies
         annual_elec_0 = float(row["annual_elec_0_kwh"])
-        annual_elec_7 = float(row["annual_elec_7_kwh"])
-        annual_elec_7_net = float(row["annual_elec_7_net_kwh"])
         annual_gas_0 = float(row["annual_gas_0_kwh"])
-        annual_gas_7 = float(row["annual_gas_7_kwh"])
-        annual_exports = float(row["annual_exports_kwh"])
 
-        # Baseline bills
+        annual_elec_0_net = float(row["annual_elec_0_net_kwh"])
+        annual_exports_0 = float(row["annual_exports_0_kwh"])
+
+        annual_elec_7 = float(row["annual_elec_7_kwh"])
+        annual_gas_7 = float(row["annual_gas_7_kwh"])
+
+        annual_elec_7_net = float(row["annual_elec_7_net_kwh"])
+        annual_exports_7 = float(row["annual_exports_kwh"])
+
+        # Baseline
         bill_ele_0 = compute_annual_electric_bill(
             annual_kwh=annual_elec_0,
             fixed_charge_monthly=elec_fixed,
@@ -1437,9 +1398,19 @@ def compute_bills_for_buildings(
             fixed_charge_monthly=gas_fixed,
             marginal_rate_per_kwh=gas_rate,
         )
-        bill_0 = bill_ele_0 + bill_gas_0
+        bill_baseline = bill_ele_0 + bill_gas_0
 
-        # Heat pump only bills
+        # Solar only (baseline + PV)
+        bill_ele_0_pv = compute_annual_electric_bill(
+            annual_kwh=annual_elec_0_net,
+            fixed_charge_monthly=elec_fixed,
+            marginal_rate_per_kwh=elec_rate,
+            annual_export_kwh=annual_exports_0,
+            export_rate_per_kwh=export_rate_per_kwh,
+        )
+        bill_solar_only = bill_ele_0_pv + bill_gas_0
+
+        # Heat pump only
         bill_ele_7 = compute_annual_electric_bill(
             annual_kwh=annual_elec_7,
             fixed_charge_monthly=elec_fixed,
@@ -1450,21 +1421,17 @@ def compute_bills_for_buildings(
             fixed_charge_monthly=gas_fixed,
             marginal_rate_per_kwh=gas_rate,
         )
-        bill_7 = bill_ele_7 + bill_gas_7
+        bill_hp = bill_ele_7 + bill_gas_7
 
-        # Heat pump + PV bills
+        # Heat pump + PV
         bill_ele_7_pv = compute_annual_electric_bill(
             annual_kwh=annual_elec_7_net,
             fixed_charge_monthly=elec_fixed,
             marginal_rate_per_kwh=elec_rate,
-            annual_export_kwh=annual_exports,
+            annual_export_kwh=annual_exports_7,
             export_rate_per_kwh=export_rate_per_kwh,
         )
-        bill_gas_7_pv = bill_gas_7  # gas use unchanged between HP and HP+PV
-        bill_7_pv = bill_ele_7_pv + bill_gas_7_pv
-
-        savings_hp = bill_0 - bill_7
-        savings_hp_pv = bill_0 - bill_7_pv
+        bill_hp_pv = bill_ele_7_pv + bill_gas_7
 
         records.append(
             {
@@ -1472,22 +1439,30 @@ def compute_bills_for_buildings(
                 "in.city": row["city"],
                 "in.state": row["state"],
                 "in.county": row["county"],
-                "bill_baseline": bill_0,
-                "bill_hp": bill_7,
-                "bill_hp_pv": bill_7_pv,
-                "savings_hp": savings_hp,
-                "savings_hp_pv": savings_hp_pv,
+
+                "bill_baseline": bill_baseline,
+                "bill_solar_only": bill_solar_only,
+                "bill_hp": bill_hp,
+                "bill_hp_pv": bill_hp_pv,
+
+                "savings_solar_only": bill_baseline - bill_solar_only,
+                "savings_hp": bill_baseline - bill_hp,
+                "savings_hp_pv": bill_baseline - bill_hp_pv,
+
                 "annual_elec_0_kwh": annual_elec_0,
+                "annual_elec_0_net_kwh": annual_elec_0_net,
+                "annual_exports_0_kwh": annual_exports_0,
+
                 "annual_elec_7_kwh": annual_elec_7,
                 "annual_elec_7_net_kwh": annual_elec_7_net,
+                "annual_exports_kwh": annual_exports_7,
+
                 "annual_gas_0_kwh": annual_gas_0,
                 "annual_gas_7_kwh": annual_gas_7,
-                "annual_exports_kwh": annual_exports,
             }
         )
 
-    bills_df = pd.DataFrame.from_records(records)
-    return bills_df
+    return pd.DataFrame.from_records(records)
 
 
 # =============================================================================
@@ -1495,124 +1470,167 @@ def compute_bills_for_buildings(
 # =============================================================================
 
 
-def _summarize_city_savings(results_df: pd.DataFrame) -> pd.DataFrame:
+def _summarize_city_savings(
+    results_df: pd.DataFrame,
+    n_boot: int = 1000,
+    ci: float = 0.95,
+    random_seed: int = 0,
+) -> pd.DataFrame:
     """
-    Compute mean savings and 95% confidence intervals by city.
+    Compute median savings and bootstrap confidence intervals by city for:
+      - Solar only
+      - Heat pump only
+      - Heat pump + solar
 
     Parameters
     ----------
     results_df : pandas.DataFrame
         DataFrame with at least:
             - "in.city"
+            - "savings_solar_only"
             - "savings_hp"
             - "savings_hp_pv"
+    n_boot : int, optional
+        Number of bootstrap resamples per city (default 1000).
+    ci : float, optional
+        Central confidence level (default 0.95). Uses the percentile
+        bootstrap interval.
+    random_seed : int, optional
+        Seed for reproducibility (default 0).
 
     Returns
     -------
     pandas.DataFrame
-        One row per city with columns:
+        One row per city with:
             - in.city
-            - mean_savings_hp
-            - ci_savings_hp
-            - mean_savings_hp_pv
-            - ci_savings_hp_pv
+            - median_savings_solar_only, ci_savings_solar_only
+            - median_savings_hp,         ci_savings_hp
+            - median_savings_hp_pv,      ci_savings_hp_pv
+
+    Notes
+    -----
+    Confidence intervals are bootstrap percentile intervals around the median.
+    The returned ``ci_*`` values are half-widths (median minus lower bound or
+    upper bound minus median, whichever is larger), suitable for symmetric
+    error bars.
     """
-    grouped = results_df.groupby("in.city")
+    rng = np.random.default_rng(random_seed)
+    alpha = (1.0 - ci) / 2.0
+    lo_q = 100.0 * alpha
+    hi_q = 100.0 * (1.0 - alpha)
 
-    summary = grouped.agg(
-        mean_savings_hp=("savings_hp", "mean"),
-        std_savings_hp=("savings_hp", "std"),
-        n_hp=("savings_hp", "count"),
-        mean_savings_hp_pv=("savings_hp_pv", "mean"),
-        std_savings_hp_pv=("savings_hp_pv", "std"),
-        n_hp_pv=("savings_hp_pv", "count"),
-    ).reset_index()
+    def median_ci_halfwidth(values: np.ndarray) -> Tuple[float, float]:
+        values = values.astype(float)
+        values = values[~np.isnan(values)]
+        if values.size == 0:
+            return (np.nan, np.nan)
+        med = float(np.median(values))
+        if values.size == 1:
+            return (med, 0.0)
 
-    z = 1.96  # Normal approx for 95% CI
-    summary["ci_savings_hp"] = z * summary["std_savings_hp"] / summary["n_hp"].pow(0.5)
-    summary["ci_savings_hp_pv"] = (
-        z * summary["std_savings_hp_pv"] / summary["n_hp_pv"].pow(0.5)
-    )
+        boots = np.empty(n_boot, dtype=float)
+        n = values.size
+        for i in range(n_boot):
+            sample = rng.choice(values, size=n, replace=True)
+            boots[i] = np.median(sample)
 
-    # Replace NaN CIs (e.g. if n=1) with 0.0 for plotting
-    summary["ci_savings_hp"] = summary["ci_savings_hp"].fillna(0.0)
-    summary["ci_savings_hp_pv"] = summary["ci_savings_hp_pv"].fillna(0.0)
+        lo = float(np.percentile(boots, lo_q))
+        hi = float(np.percentile(boots, hi_q))
+        halfwidth = max(med - lo, hi - med)
+        return (med, halfwidth)
 
-    return summary
+    rows = []
+    for city, g in results_df.groupby("in.city"):
+        m_solar, ci_solar = median_ci_halfwidth(g["savings_solar_only"].to_numpy())
+        m_hp, ci_hp = median_ci_halfwidth(g["savings_hp"].to_numpy())
+        m_hp_pv, ci_hp_pv = median_ci_halfwidth(g["savings_hp_pv"].to_numpy())
+
+        rows.append(
+            {
+                "in.city": city,
+                "median_savings_solar_only": m_solar,
+                "ci_savings_solar_only": ci_solar,
+                "median_savings_hp": m_hp,
+                "ci_savings_hp": ci_hp,
+                "median_savings_hp_pv": m_hp_pv,
+                "ci_savings_hp_pv": ci_hp_pv,
+                "n": int(len(g)),
+            }
+        )
+
+    return pd.DataFrame(rows)
 
 
 def plot_city_bill_savings(
     results_df: pd.DataFrame,
     cities: Sequence[str],
-    figsize: Tuple[int, int] = (10, 6),
+    figsize: Tuple[int, int] = (11, 6),
+    n_boot: int = 1000,
+    ci: float = 0.95,
+    random_seed: int = 0,
 ) -> None:
     """
-    Create a grouped bar plot by city showing bill savings from:
-        - Heat pump only (HP)
-        - Heat pump + solar (HP + PV)
+    Grouped bar plot by city showing median annual bill savings for:
+        - Heat pump only
+        - Heat pump + solar
+        - Solar only
 
-    with 95% confidence intervals as error bars.
+    Includes bootstrap confidence intervals (default 95%) as error bars.
 
-    Cities are first filtered to the supplied `cities` list, then
-    ordered from highest to lowest mean HP + PV savings.
-
-    Parameters
-    ----------
-    results_df : pandas.DataFrame
-        Per-building results from compute_bills_for_buildings, with at
-        least columns:
-            - "in.city"
-            - "savings_hp"
-            - "savings_hp_pv"
-    cities : Sequence[str]
-        List of cities to include in the plot.
-    figsize : tuple[int, int], optional
-        Matplotlib figure size in inches, default (10, 6).
-
-    Returns
-    -------
-    None
-        Displays the plot using matplotlib.
+    Cities are filtered to `cities` and ordered by highest to lowest
+    median heat pump + solar savings.
     """
-    # Filter to requested cities
     df = results_df[results_df["in.city"].isin(cities)].copy()
     if df.empty:
         raise ValueError("No buildings found for the specified cities.")
 
-    # Summarize savings per city
-    summary = _summarize_city_savings(df)
+    summary = _summarize_city_savings(
+        df, n_boot=n_boot, ci=ci, random_seed=random_seed
+    )
 
-    # Order cities by mean HP + PV savings (descending)
+    # Order cities by HP + PV savings (descending)
     summary = summary.sort_values(
-        "mean_savings_hp_pv", ascending=False
+        "median_savings_hp_pv", ascending=False
     ).reset_index(drop=True)
 
     x = np.arange(len(summary))
-    width = 0.35
+    width = 0.25
 
     fig, ax = plt.subplots(figsize=figsize)
 
+    # ---- Bar order: HP | HP + PV | Solar only ----
     ax.bar(
-        x - width / 2,
-        summary["mean_savings_hp"],
+        x - width,
+        summary["median_savings_hp"],
         width,
         #yerr=summary["ci_savings_hp"],
         capsize=4,
         label="Heat pump only",
     )
     ax.bar(
-        x + width / 2,
-        summary["mean_savings_hp_pv"],
+        x,
+        summary["median_savings_hp_pv"],
         width,
         #yerr=summary["ci_savings_hp_pv"],
         capsize=4,
         label="Heat pump + solar",
     )
+    ax.bar(
+        x + width,
+        summary["median_savings_solar_only"],
+        width,
+        #yerr=summary["ci_savings_solar_only"],
+        capsize=4,
+        label="Solar only",
+    )
 
     ax.set_xticks(x)
     ax.set_xticklabels(summary["in.city"], rotation=45, ha="right")
-    ax.set_ylabel("Annual bill savings ($/year)")
-    ax.set_title("Bill savings by city: heat pump vs. heat pump + solar")
+    ax.set_ylabel("Median Annual bill savings ($/year)")
+    ax.set_title(
+        "Bill savings by city: heat pump vs. heat pump + solar vs. solar"
+    )
     ax.legend()
     plt.tight_layout()
     plt.show()
+
