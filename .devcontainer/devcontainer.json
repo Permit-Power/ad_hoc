@@ -2,6 +2,9 @@
   "name": "ad_hoc",
   "image": "mcr.microsoft.com/devcontainers/python:3.11",
   "postCreateCommand": "pip install pandas jupyter ipykernel && curl -fsSL https://claude.ai/install.sh | bash",
+  "features": {
+    "ghcr.io/devcontainers/features/git-lfs:1": {}
+  },
   "customizations": {
     "vscode": {
       "extensions": [
