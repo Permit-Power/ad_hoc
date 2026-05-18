@@ -283,6 +283,65 @@ Create a **visual cost breakdown** of solar installation costs in Illinois, comp
 
 ---
 
+## 7) Illinois Panel Upgrade Constraint Analysis (ResStock)
+
+**Primary artifacts**
+- Notebook: `illinois_panel_analysis.ipynb`
+
+### Purpose
+Quantify how many Illinois residential homes face **electric panel constraints** when adding a heat pump or EV charger, broken down by panel size. Uses ResStock 2024 metadata and NEC 2023 existing dwelling load calculations.
+
+### Methodology
+
+#### Data sources
+- **ResStock metadata CSVs** (local):
+  - `../data/IL_upgrade0.csv` — baseline, used for panel size and building type
+  - `../data/IL_upgrade4.csv` — heat pump upgrade scenario
+  - `../data/IL_upgrade23.csv` — EV charger upgrade scenario
+
+#### Key columns
+- `in.electric_panel_service_rating_bin..a` — panel size bucket (<100, 100, 125, 200, etc.)
+- `out.params.panel_constraint_capacity.2023_nec_existing_dwelling_load_based` — boolean, True if panel is over capacity after upgrade
+- `out.params.panel_constraint_breaker_space` — boolean, True if no breaker slots available
+- `out.params.panel_constraint_overall.2023_nec_existing_dwelling_load_based` — categorical: "No Constraint", "Capacity Constrained Only", "Space Constrained Only", "Capacity and Space Constrained"
+
+All results are weighted by `weight` to represent actual housing units.
+
+#### Key calculations
+- Panel size distribution (all homes and single-family only)
+- % of homes with ≤100A panels
+- Crosstab: panel size × capacity/space constraint after heat pump upgrade
+- Overall: share of single-family homes constrained for HP or EV upgrade
+
+### Outputs
+- Summary tables and crosstabs displayed inline in the notebook
+
+---
+
+## 8) Illinois HVAC Permit Analysis (Shovels API)
+
+**Primary artifacts**
+- Notebook: `illinois_hvac_permit_analysis.ipynb`
+
+### Purpose
+Estimate the volume of **heat pump** and **electric panel upgrade** permits pulled in Illinois using the Shovels permit API, to understand real-world electrification activity.
+
+### Methodology
+
+#### Data sources
+- **Shovels API** (`https://api.shovels.ai/v2/permits/search`) — residential permits for Illinois, queried by keyword and permit tags with cursor-based pagination
+- Date range: 2014–2021 (heat pump permits); 2020–2021 for initial panel keyword volume gauging
+
+#### Key calculations
+- Fetch heat pump permits using multiple keyword variants (`heat pump`, `mini split`, `mini-split`, `minisplit`, `geothermal`, `ground source`) and deduplicate on permit ID
+- Fetch panel upgrade permits using keyword variants (`electric panel`, `panel upgrade`, `service upgrade`, etc.)
+- Aggregate permit counts by year and keyword to identify trends
+
+### Outputs
+- Permit count summaries by keyword and year, displayed inline in the notebook
+
+---
+
 ## 6) Rockefeller / EIG Index × Solar Jobs Distribution (State-level rollups)
 
 **Primary artifacts**
