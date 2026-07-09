@@ -396,3 +396,85 @@ Estimate how changes in distributed solar adoption under a “$ / watt” policy
 - Printed QA checks (e.g., column-wise sums).
 
 ---
+
+## 9) Texas Panel Size Analysis (ResStock)
+
+**Primary artifacts**
+- Notebook: `texas_panel_analysis.ipynb`
+
+### Purpose
+Replicate the Illinois panel size analysis for **Texas**, characterizing the distribution of residential electric panel sizes using ResStock 2024 baseline metadata. Focused on single-family homes and the share with panels ≤125A.
+
+### Methodology
+
+#### Data sources
+- **ResStock metadata CSV** (local): `../data/TX_upgrade0.csv` — baseline (no upgrades applied)
+
+#### Key columns
+- `in.electric_panel_service_rating_bin..a` — panel size bucket (<100, 100, 125, 200, etc.)
+- `in.geometry_building_type_acs` — used to filter to single-family attached/detached
+- `weight` — housing unit weight for statewide estimates
+
+#### Key calculations
+- Panel size distribution (all homes and single-family only), weighted by `weight`
+- Share of homes with panels ≤125A
+
+### Outputs
+- Summary tables displayed inline in the notebook
+
+---
+
+## 10) California Inspection Timelines (SF Permits + Shovels)
+
+**Primary artifacts**
+- Notebook: `california_inspection_timelines.ipynb`
+
+### Purpose
+Analyze residential building inspection timelines in San Francisco to understand how long inspections take and whether remote inspections could speed up the process. Originally scoped to multiple California cities; SF was the only city with sufficient structured data for a permit-level timeline analysis.
+
+### Methodology
+
+#### Data sources
+- **SF Building Inspections** (local): `../data/Building_Inspections_20260519.csv` — ~686K rows, one per inspection event
+- **SF Building Permits** (local): `../data/Building_Permits_20260519.csv` — ~1.3M rows, one per permit
+- **SD County Building Inspections** (local): `../data/SanDiegoCounty_Building_Inspections_20260520.csv` — explored but lacks a "request received" timestamp for timeline comparison
+
+#### Key calculations
+1. **Join**: filter inspections to `reference_number_type == 'permit'`, join to permits on `reference_number` = `Permit Number` (100% match rate)
+2. **Collapse to permit level**: `first_request_taken_date`, `last_appointment_date`, `span_days`, `inspection_count`, `any_failed`, `has_sequential_stages`, `has_duplicate_descriptions`, `has_cancellation_or_siteverif`
+3. **Filter**: residential occupancy only (exact R-2 or R-3), completed permits, 2016–2026
+4. **Work type classification**: regex-based flags for AB 1738 categories (Tier 1: homeowner discretion; Tier 2: inspector discretion) applied to permit `Description` field
+
+#### Key flags
+- `span_days` — days from first inspection request to last inspection appointment
+- `any_failed` — whether any inspection in the permit's history failed
+- `is_tier1` / `is_tier2` — whether the permit falls under AB 1738 remote inspection categories
+- `is_revision` — whether the permit description contains "revision to"
+
+### Outputs
+- `../outputs/building_inspections_permits_full.csv` — full filtered dataset with all flags, ready for Excel pivot analysis
+
+---
+
+## 11) Florida Shovels Exploration (Shovels API)
+
+**Primary artifacts**
+- Notebook: `florida_shovels_exploration.ipynb`
+
+### Purpose
+Exploratory pull of Florida residential permits from the Shovels API (2026 YTD) to understand what inspection timeline and person/identity fields are available in the data.
+
+### Methodology
+
+#### Data sources
+- **Shovels API** (`https://api.shovels.ai/v2/permits/search`) — residential permits for Florida, Jan–Apr 2026, sample of 100 records
+
+#### Key calculations
+- Fetch a sample and print all available fields
+- Auto-detect inspection/timeline columns and person/ID columns, with sample values
+- Print one full raw record for detailed field inspection
+
+### Outputs
+- Field inventory displayed inline — no file outputs (exploratory only)
+
+---
