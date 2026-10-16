@@ -146,103 +146,119 @@ Identical to the NJ workflow with these differences:
 
 ---
 
-## 4) Heating Electrification Bill Savings With and Without Rooftop PV (ResStock + PySAM)
+## 4) Heat Pump Operating Costs With and Without Solar (ResStock + PySAM + EIA)
 
 **Primary artifacts**
 - Notebook: `solar_bill_analysis.ipynb`
-- Module: `solar_bill_analysis.py` 
+- Modules: `solar_bill_analysis.py`, `eia_rates.py`
 
 ### Purpose
-Quantify how annual household utility bills change under:
-- **Baseline** (ResStock Upgrade 0),
-- **Heat pump** (Upgrade 7),
-- **Heat pump + rooftop PV** (Upgrade 7 net of PV),
-and visualize savings by city (median + bootstrap confidence intervals).
+For U.S. single-family, owner-occupied homes that heat with gas, answer three questions:
+1. **Is a heat pump cheaper to run than the gas furnace it replaces?** On grid power, and with rooftop solar at $3.62/W (today, LBNL), $2/W and $1/W (peer-country cost).
+2. **Do overall energy bills go down** with a heat pump + rooftop solar package, compared with today?
+3. **How much would small plug-in solar systems** (391W and 1,200W) lower a heat pump home's bills?
+
+Questions 1 and 2 are also run with a home battery and under two export policies (current policy, and net metering phased out).
+
+The heat pump is ResStock Upgrade 2 (high-efficiency cold-climate heat pump with electric backup, no envelope measures). Heat pump equipment costs are not included; results compare the cost to run each option.
+
+### Key results (5,000-home run, October 2026)
+
+**1. Heat pump vs. gas furnace** (median gas heating bill $970/yr; share of homes where the heat pump is cheaper to run, median savings)
+
+| Scenario | Current policy | Net metering phased out |
+|---|---|---|
+| Heat pump on grid power | 49%, −$17/yr | 49%, −$17/yr |
+| + solar $3.62/W | 47%, −$56/yr | 31%, −$491/yr |
+| + solar $2/W | 69%, +$272/yr | 44%, −$100/yr |
+| + solar $1/W | 82%, +$420/yr | 60%, +$123/yr |
+| + solar $1/W + battery $400/kWh | 83%, +$418/yr | 64%, +$143/yr |
+
+**2. Overall energy bills, heat pump + solar vs. today** (share of homes that save, median savings)
+
+| Scenario | Current policy | Net metering phased out |
+|---|---|---|
+| Heat pump alone | 49%, −$17/yr | 49%, −$17/yr |
+| + solar $3.62/W | 31%, −$376/yr | 6%, −$1,301/yr |
+| + solar $2/W | 77%, +$627/yr | 42%, −$147/yr |
+| + solar $1/W | 96%, +$1,282/yr | 82%, +$534/yr |
+
+Batteries ($1,200/$800/$400 per kWh with $3.62/$2/$1 per W solar) barely change result 1 and lower result 2 under current policy; with net metering phased out they recover a little of the lost value. See the notebook for all battery rows.
+
+**3. Plug-in solar on a heat pump home** (national medians)
+
+| | 391W | 1,200W |
+|---|---|---|
+| Production | ~500 kWh/yr | ~1,535 kWh/yr |
+| Share used (no export credit) | 100% | 94% |
+| Bill savings | ~$82/yr | ~$239/yr |
+| Share of heat pump electricity cost (heating + cooling) | ~6% | ~16% |
 
 ### Methodology
 
 #### Data sources
-1. **ResStock metadata** (local)
-   - Notebook reads `../data/upgrade07.parquet`.
-   - Used for:
-     - building IDs and location fields (`in.city`, `in.state`, `in.county`)
-     - roof area (`out.params.roof_area_ft_2`)
-     - orientation (`in.orientation`)
-     - weather file coordinates (`in.weather_file_latitude`, `in.weather_file_longitude`, optionally timezone/elevation)
-     - simplified tariff fields:
-       - `in.utility_bill_electricity_fixed_charges`
-       - `in.utility_bill_electricity_marginal_rates`
-       - `in.utility_bill_natural_gas_fixed_charges`
-       - `in.utility_bill_natural_gas_marginal_rates` (in $/therm)
+1. **ResStock 2024 Release 2 metadata and annual results** (remote, OEDI data lake)
+   - `load_resstock_metadata(...)` reads `metadata/upgradeNN.parquet` directly from S3 with filters pushed down to DuckDB.
+   - Used for building selection, location, roof area, orientation, weather file coordinates and annual end-use energy.
 
 2. **ResStock hourly end-use profiles** (remote, OEDI data lake)
-   - Read from `oedi-data-lake` ResStock timeseries Parquet files for upgrades `("0","7")`.
-   - Hourly series used:
-     - `out.electricity.total.energy_consumption` → `elec_kwh`
-     - `out.natural_gas.total.energy_consumption` → `gas_kwh`
+   - Upgrades `("0", HP_UPGRADE)`; hourly series `out.electricity.total.energy_consumption` → `elec_kwh` and `out.natural_gas.total.energy_consumption` → `gas_kwh`.
 
-3. **ResStock HPXML building energy models** (remote, via URL)
-   - Used to infer roof planes for PV placement (tilt + azimuth).
+3. **ResStock HPXML building energy models** (remote) — roof planes for PV tilt and azimuth.
 
-4. **ResStock TMY3 weather CSVs** (remote, via URL)
-   - Used to construct PVWatts-compatible `solar_resource_data` for PySAM.
+4. **ResStock TMY3 weather CSVs** (remote) — PVWatts solar resource data.
 
-5. **PV generation cache** (local convenience)
-   - The notebook loads a precomputed `../data/pv_all.csv` (hourly PV by building), which can be regenerated by uncommenting the PV loop.
+5. **EIA rates** (remote, via `eia_rates.py`)
+   - Electricity: EIA-861M monthly residential revenue, sales and customers by state.
+   - Gas: monthly residential prices and volumes, and annual residential consumer counts, by state.
+
+6. **DSIRE net metering map** (local) — `../data/dsire_iou_net_metering_may2026.csv`, residential IOU export compensation policy by state. DC is not in the file and is treated as net billing.
+
+7. **Hourly wholesale export rates** (local, from dGen) — `../data/dgen_export_rates_hourly_by_county.csv.gz`, 8,760 hourly $/kWh values per county, loaded with `load_wholesale_export_rates(...)`. Used for the "net metering phased out" policy. About 31% of counties (non-RTO regions) only have monthly values, which overstate the value of midday exports.
 
 #### Key calculations
 
-1. **Filter target buildings**
-   The notebook filters to buildings meeting conditions like:
-   - natural gas primary heating fuel,
-   - heat pump upgrade applicable,
-   - owner-occupied single-family detached,
-   - selected target cities.
+1. **Sample buildings**
+   - Natural gas primary heating fuel, heat pump upgrade applicable, owner-occupied single-family detached (137,144 eligible).
+   - Simple random sample of 5,000 buildings (seed 42). ResStock weights are uniform, so the sample is nationally representative.
 
-2. **Build hourly electricity + gas profiles**
-   `build_building_hourly_profiles(...)` pulls building-level time series (S3 → DuckDB), aggregates to hourly, and returns a tidy table with:
-   - `bldg_id`, `upgrade`, `ts_hour`, `elec_kwh`, `gas_kwh`
-   - location fields (`in.city`, `in.state`, `in.county`)
+2. **Simulate rooftop PV** — `compute_pv_for_buildings(...)` runs `compute_pv_for_building(...)` in parallel:
+   - Fixed roof-mount array (`array_type=1`; PySAM's `PVWattsSingleOwner` default is 1-axis tracking, so this must be set).
+   - Tilt and azimuth from the largest south-ish HPXML roof plane, else the plane facing closest to south. Homes with no pitched roof planes (flat roofs) use the front or back of the house, whichever faces closer to south, at a default tilt.
+   - `simulate_pv_per_kw(...)` runs PVWatts for a 1 kW system; output scales linearly with size.
+   - `sizing_mode="min"` (`size_pv_system_kw(...)`): the smaller of roof-based size (`roof_area_ft2 * 15 W/ft2`) and load-based size (100% of annual load, using the home's simulated output per kW), capped at 25 kW (`max_system_kw`).
+   - Homes size to their own load: with a heat pump, against the heat pump scenario's load (median 12.1 kW); without one, a smaller system against the baseline load (median 7.5 kW), scaling the same simulated profile.
 
-3. **Simulate hourly rooftop PV generation**
-   `compute_pv_for_building(...)`:
-   - Determines PV **tilt and azimuth**:
-     - Prefer HPXML-derived roof plane: largest “south-ish” plane (azimuth 135°–225°),
-     - Otherwise fall back to a default tilt + orientation-based azimuth.
-   - Sizes PV capacity (kW) via `PVSimulationConfig`:
-     - roof-based sizing: `kW = roof_area_ft2 * watts_per_ft2 / 1000`
-     - load-based sizing: choose kW so annual PV ≈ `target_solar_fraction * annual_load`,
-       using `assumed_cf` to convert kW → annual kWh (`assumed_cf * 8760`)
-     - `sizing_mode="min"` uses the *minimum* of roof-based and load-based sizes (i.e., caps load-sized PV by roof feasibility).
-   - Builds PVWatts weather input by converting ResStock TMY3 CSV columns to PVWatts keys.
-   - Runs PySAM PVWatts and interprets hourly AC output as hourly kWh.
+3. **Hourly netting** — `compute_annual_flows(...)` nets PV against hourly load for four setups (with/without a heat pump, each with/without a battery) and returns annual grid imports, exports, and exports valued at hourly wholesale prices. `simulate_battery(...)` dispatches a 13.5 kWh / 5 kW battery (90% round-trip) to store surplus solar for later use in the home; it never charges from the grid. `compute_bills_for_buildings(...)` is kept as a QA check.
 
-4. **Compute annual bills under each scenario**
-   `compute_bills_for_buildings(...)` computes per-building annual bills for:
-   - Baseline (U0): electricity + gas
-   - Solar-only (U0 + PV): baseline electricity netted with PV (hourly), gas unchanged
-   - Heat pump (U7): electricity + gas
-   - Heat pump + PV (U7 + PV): U7 electricity netted with PV (hourly)
+4. **Rates** — `build_state_residential_rates(...)` returns state marginal rates over the latest 12 months: average price with a fixed monthly customer charge removed (`(revenue - fixed * customer_months) / sales`; defaults $10/month electric, $11.25/month gas, matching ResStock). Fixed charges are paid in every scenario, so only marginal rates affect the comparisons.
 
-   Key billing assumptions:
-   - Flat volumetric tariffs:
-     - Electric bill = `fixed_monthly * 12 + annual_kwh * rate - annual_exports * export_rate`
-     - Gas bill = `fixed_monthly * 12 + annual_gas_kwh * gas_rate_per_kwh`
-   - Gas marginal rates are converted from \$/therm to $/kWh using:
-     - `1 therm = 29.3 kWh`
+5. **Export credit by state** (DSIRE), under current policy: retail rate (or the stated % of retail, e.g. Nevada 75%) in net metering states, $0.05/kWh in net billing states and those with no policy (Tennessee, DC), and the average of the two where policy is mixed (Texas). Illinois (10.3¢, Price to Compare) and Michigan (7.5¢, DTE power supply less estimated transmission) credit exports at the utility's supply rate and are set via `STATE_EXPORT_RATE_OVERRIDES`. With net metering phased out, exports in every state are credited at the county's hourly wholesale price (set `WHOLESALE_IN_NET_BILLING_STATES = False` to switch only net metering and mixed-policy states).
 
-5. **Aggregate + plot savings by city**
-   - Savings are computed relative to baseline.
-   - City-level summaries use median savings per city and bootstrap percentile confidence intervals.
-   - `plot_city_bill_savings(...)` produces grouped bar charts (HP-only vs HP+PV vs solar-only).
+6. **Solar and battery cost** — `financed_annual_cost(...)` spreads a down payment and loan into an equal yearly amount in today's dollars over the equipment's life. Solar (`solar_annual_cost_per_kw(...)` × system size): 30% down, the rest financed at 7% over 20 years, 25-year life, 5% nominal discount rate, 2.5% inflation, no O&M, no incentives. Batteries: same terms over a 15-year life and loan. `solar_lcoe(...)` reports the equivalent cost per kWh for reference.
+
+7. **Scenarios** — solar at $3.62, $2 and $1/W, each with and without a battery ($1,200, $800 and $400/kWh), under both export policies.
+
+8. **Result 1: heat pump running cost** — the gas heating bill the heat pump replaces vs. the heat pump's electricity cost (net of the AC it replaces). On grid power, its extra kWh at the marginal rate; with solar, the difference in electricity costs (grid, exports, panels and any battery) between the home with the heat pump and larger system and the home without one and the smaller system. Solar's savings on other loads cancel, so this isolates the heat pump. Covers heating and cooling.
+
+9. **Result 2: overall bills** — total annual energy costs (gas + electricity + solar and battery payments) with the heat pump + solar package vs. today's gas-heated home with no solar. Includes solar's savings on all of the home's electricity.
+
+10. **Result 3: plug-in solar** — `compute_plugin_solar(...)` simulates 391W and 1,200W systems facing south at a 20° tilt (PVWatts defaults, fixed open rack) on each home with the heat pump. With no export compensation, each hour the home uses what it can and any surplus is lost. Savings are self-consumed kWh at the state's marginal rate, also shown as a share of the heat pump's heating and cooling electricity cost (from ResStock annual end uses). Plug-in system costs are not included.
+
+Batches of 500 buildings are cached to `../data/solar_bill_national_sample_u{HP_UPGRADE}_{SAMPLE_SIZE}_seed{RANDOM_SEED}/` as they finish, so re-runs skip the S3 downloads and PVWatts runs (a full run takes about an hour; from the cache, about two minutes).
+
+#### Known limitations
+- Flat volumetric rates: no time-of-use or tiered pricing, which understates battery value where evening prices are high (e.g. California).
+- Typical-year (TMY3) weather and hourly netting; real net billing meters exports instantaneously, so self-consumption is slightly overstated.
+- Utility rates and export policies are applied at the state level; co-op and municipal customers are treated like the state's IOU customers.
+- The Michigan transmission deduction is an estimate, and Consumers Energy's rates were not checked.
+- No equipment costs for the heat pump, no incentives, and no value for backup power.
 
 ### Outputs
-- **PV output (optional intermediate)**: `pv_all.csv`
-  - `bldg_id`, `ts_hour`, `pv_kwh`, (optionally `system_kw`)
-- **Per-building bills and savings**: `bills_df` DataFrame
-  - `bill_baseline`, `bill_solar_only`, `bill_hp`, `bill_hp_pv`
-  - `savings_solar_only`, `savings_hp`, `savings_hp_pv`
-- **Plots**: grouped bar charts by city (median savings; CI optional)
+- **Per-building annual results** (`bills_df`, cached as CSV batches): annual electricity and gas use, system sizes, and annual imports/exports for each setup.
+- `../outputs/heat_pump_running_cost_vs_gas.csv` — result 1, by scenario and export policy.
+- `../outputs/heat_pump_solar_overall_bills_vs_today.csv` — result 2, by scenario and export policy.
+- `../outputs/plugin_solar_with_heat_pump_by_state.csv` — result 3, nationally and by state.
 
 ---
 

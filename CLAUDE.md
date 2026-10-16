@@ -36,14 +36,16 @@ Current module–notebook pairs:
 | Module | Notebook(s) | Purpose |
 |---|---|---|
 | `build_hourly_load.py` | `nj_hourly_profiles.ipynb`, `co_hourly_profiles.ipynb`, `il_hourly_profiles.ipynb`, `ma_hourly_profiles.ipynb` | City-level median hourly electricity profiles from ResStock |
-| `solar_bill_analysis.py` | `solar_bill_analysis.ipynb` | Household utility bill savings under heat pump + rooftop PV scenarios |
+| `solar_bill_analysis.py` | `solar_bill_analysis.ipynb` | Heat pump running costs vs. gas, with rooftop solar, batteries and plug-in solar (national ResStock sample) |
+| `eia_rates.py` | `solar_bill_analysis.ipynb` | State marginal residential electricity and gas rates from EIA (fixed charges removed) |
 | `avoided_gas_capacity.py` | `avoided_gas_capacity.ipynb` | Natural gas displacement from increased solar adoption |
 
 ## Key Data Sources
 
 - **ResStock timeseries** (remote): S3 bucket `oedi-data-lake` (us-west-2), accessed via DuckDB + HTTPFS without credentials (public bucket). Path pattern: `s3://oedi-data-lake/nrel-pds-building-stock/end-use-load-profiles-for-us-building-stock/2024/resstock_tmy3_release_2/timeseries_individual_buildings/by_state/upgrade={u}/state={state}/{bldg_id}-{u}.parquet`
-- **ResStock metadata** (local): Parquet files like `../data/baseline.parquet`, `../data/upgrade07.parquet`
-- **PV generation cache** (local): `../data/pv_all.csv` — precomputed to avoid re-running PySAM for every notebook run
+- **ResStock metadata** (remote): `load_resstock_metadata(...)` reads `metadata/upgradeNN.parquet` from the same S3 release with filters pushed down to DuckDB. Some older notebooks still read local copies like `../data/baseline.parquet`.
+- **Solar bill analysis cache** (local): `../data/solar_bill_national_sample_*/batch_NN.csv` — per-building annual results cached in batches so re-runs skip S3 downloads and PVWatts
+- **Export policy inputs** (local): `../data/dsire_iou_net_metering_may2026.csv` (DSIRE state policies) and `../data/dgen_export_rates_hourly_by_county.csv.gz` (hourly wholesale export rates by county, from dGen)
 
 ## Key Libraries
 
