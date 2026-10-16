@@ -1,42 +1,22 @@
 """
-hp_solar_bill_analysis.py
+solar_bill_analysis.py
 
-End-to-end utilities to:
+Building-level simulation for comparing heat pump and gas furnace running
+costs, with and without rooftop solar, batteries and plug-in solar, using
+ResStock building data and PySAM PVWatts.
 
-1. Pull ResStock building-level hourly electricity and natural gas profiles.
-2. Extract roof tilt and azimuth from HPXML for PV placement.
-3. Use NREL's PySAM PVWatts to simulate hourly rooftop PV generation.
-4. Compute annual utility bills for:
-   - Baseline (Upgrade 0),
-   - Heat pump only (Upgrade 7),
-   - Heat pump + rooftop PV (Upgrade 7 net of PV),
-   using simple volumetric tariffs from ResStock metadata.
-5. Generate grouped bar plots by city showing bill savings from
-   heat pumps and heat pumps + solar, with 95% confidence intervals.
+Main steps, in the order the notebook calls them:
 
-The design follows four main functions:
+    load_resstock_metadata(...)          ResStock metadata from S3
+    build_building_hourly_profiles(...)  hourly electricity and gas load per building
+    compute_pv_for_buildings(...)        rooftop PV sized and simulated per building
+    compute_annual_flows(...)            annual grid imports/exports with and without
+                                         a heat pump, each with and without a battery
+    compute_plugin_solar(...)            plug-in solar production and self-consumption
+    financed_annual_cost(...)            yearly cost of financed equipment
 
-    1) build_building_hourly_profiles(...)
-    2) compute_pv_for_building(...)
-    3) compute_bills_for_buildings(...)
-    4) plot_city_bill_savings(...)
-
-Additional helpers are provided for:
-    - loading ResStock metadata from S3,
-    - HPXML parsing (roof tilt/azimuth),
-    - orientation mapping,
-    - simple tariff calculations.
-
-Dependencies
-------------
-- duckdb
-- pandas
-- numpy
-- matplotlib
-- PySAM (Pvwattsv8)
-- xml.etree.ElementTree (standard library)
-- zipfile (standard library)
-- math (standard library)
+Supporting helpers cover HPXML roof parsing, PV sizing, ResStock weather files,
+battery dispatch and hourly wholesale export rates.
 """
 
 from __future__ import annotations
@@ -49,7 +29,6 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Any
 
 import duckdb
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import shutil
@@ -326,7 +305,7 @@ def select_pv_roof_from_hpxml(
 
 
 def load_resstock_metadata(
-    upgrade: str = "7",
+    upgrade: str = "2",
     filters: Optional[Dict[str, Any]] = None,
     bucket: str = "oedi-data-lake",
     base_prefix: str = (
@@ -350,7 +329,7 @@ def load_resstock_metadata(
     Parameters
     ----------
     upgrade : str, optional
-        Upgrade label as a string (e.g. "0", "7"). Defaults to "7".
+        Upgrade label as a string (e.g. "0", "2"). Defaults to "2".
     filters : dict, optional
         Mapping of metadata column → value to keep. A list or tuple value
         keeps rows matching any of its elements, e.g.
@@ -359,8 +338,8 @@ def load_resstock_metadata(
     bucket : str, optional
         S3 bucket name. Defaults to "oedi-data-lake".
     base_prefix : str, optional
-        S3 prefix of the metadata directory. A sensible default is provided
-        for the ResStock TMY3 2024 release.
+        S3 prefix of the metadata directory. Defaults to the ResStock TMY3 2024
+        Release 2 metadata.
     region : str, optional
         AWS region of the bucket. Defaults to "us-west-2".
 
@@ -408,7 +387,7 @@ def load_resstock_metadata(
 def build_building_hourly_profiles(
     bldg_ids: Sequence[str],
     metadata_df: pd.DataFrame,
-    upgrades: Sequence[str] = ("0", "7"),
+    upgrades: Sequence[str] = ("0", "2"),
     bucket: str = "oedi-data-lake",
     base_prefix: str = (
         "nrel-pds-building-stock/end-use-load-profiles-for-us-building-stock/"
@@ -428,7 +407,7 @@ def build_building_hourly_profiles(
     tidy DataFrame with:
 
         - bldg_id  : str
-        - upgrade  : str ("0" for baseline, "7" for heat pump, etc.)
+        - upgrade  : str ("0" for baseline, or an upgrade number)
         - ts_hour  : pandas.Timestamp (hourly)
         - elec_kwh : float (hourly electricity consumption)
         - gas_kwh  : float (hourly natural gas consumption)
@@ -436,9 +415,8 @@ def build_building_hourly_profiles(
         - in.state
         - in.county
 
-    Unlike a single-state implementation, bldg_ids may span multiple
-    states. In that case, the S3 paths are constructed using the
-    per-building state from metadata_df["in.state"].
+    bldg_ids may span multiple states; each building's S3 path uses its
+    state from metadata_df["in.state"].
 
     Parameters
     ----------
@@ -456,7 +434,7 @@ def build_building_hourly_profiles(
         Additional columns (tariffs, roof area, etc.) may be present
         and will be joined later by other functions.
     upgrades : Sequence[str], optional
-        Upgrades to load (default is both "0" and "7").
+        Upgrades to load. Defaults to ("0", "2").
     bucket : str, optional
         S3 bucket name for OEDI data.
     base_prefix : str, optional
@@ -535,7 +513,6 @@ def build_building_hourly_profiles(
         con.execute("SET s3_url_style = 'path';")
 
         # Build S3 paths for this chunk
-        # Note: state is now per-building from metadata_df, not a single arg.
         paths = []
         for u in upgrades_seq:
             for bid in ids_chunk:
@@ -571,9 +548,6 @@ def build_building_hourly_profiles(
         )
         con.close()
         return part_path
-
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    import os
 
     # Dispatch chunks
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -682,12 +656,8 @@ class PVSimulationConfig:
         2 = 1-axis tracking, 3 = 1-axis backtracking, 4 = 2-axis tracking.
         Defaults to 1 (rooftop).
     tilt_default_deg : float
-        Default tilt in degrees. Used only when HPXML-based tilt cannot
-        be determined, in which case tilt_default_deg is combined with
-        in.orientation to define array geometry.
-    export_rate_per_kwh : float
-        Export credit rate ($/kWh) used for bill calculation in net
-        billing mode when required.
+        Tilt in degrees used when the building has no pitched roof planes
+        in its HPXML (e.g. flat roofs) or the HPXML can't be read.
     """
 
     sizing_mode: str = "roof"          # "roof", "load", or "min"
@@ -699,7 +669,6 @@ class PVSimulationConfig:
     gcr: float = 0.4
     array_type: int = 1                # fixed roof mount
     tilt_default_deg: float = 25.0
-    export_rate_per_kwh: float = 0.0
 
 
 def _size_pv_from_roof_area(roof_area_ft2: float, watts_per_ft2: float) -> float:
@@ -1061,157 +1030,44 @@ def simulate_pv_per_kw(
 
 def compute_pv_for_building(
     metadata_row: pd.Series,
-    hourly_u7: pd.Series,
+    hourly_load_kwh: pd.Series,
     pv_config: PVSimulationConfig,
     weather_base_prefix: str,
     hpxml_zip_path: Optional[str] = None,
 ) -> Tuple[pd.Series, float]:
     """
-    Compute hourly rooftop PV generation for a single building using PySAM
-    PVWatts (Pvwattsv8), with tilt and azimuth derived from HPXML where
-    available and weather data from the ResStock TMY3 CSV.
+    Size and simulate hourly rooftop PV generation for one building.
 
-    Steps
-    -----
-    1. Determine array tilt and azimuth:
-
-        - If ``hpxml_zip_path`` is provided, attempt to parse the HPXML
-          ZIP (downloading it first if it is an HTTP(S) URL) using
-          :func:`select_pv_roof_from_hpxml`. On success, use the
-          returned tilt and azimuth (degrees) for the array.
-
-        - If HPXML is not provided, parsing fails, or the roof has no
-          pitched planes (ResStock models homes with no attic as flat
-          roofs), fall back to:
-
-              * Tilt = ``pv_config.tilt_default_deg``
-              * Azimuth = the front or back of the house
-                (``metadata_row["in.orientation"]`` or its opposite),
-                whichever faces closer to south, as for a gable roof.
-
-          If orientation mapping fails, azimuth defaults to 180° (south).
-
-    2. Size the system according to ``pv_config.sizing_mode``:
-
-        - ``"roof"``:
-            Size from roof area and ``pv_config.watts_per_ft2`` using
-            :func:`_size_pv_from_roof_area` and the metadata field
-            ``"out.params.roof_area_ft_2"`` (default 0.0 if missing).
-
-        - ``"load"``:
-            Size to cover ``pv_config.target_solar_fraction`` of the annual
-            load in ``hourly_u7``, converting kWh to kW with
-            ``pv_config.assumed_cf`` or, if that is None, with the
-            building's simulated output per kW (PVWatts is run for a 1 kW
-            system first and the output scaled to the chosen size).
-
-        - ``"min"``:
-            Compute both roof-based and load-based sizes and use the
-            minimum of the two.
-
-       If the resulting ``system_capacity_kw`` is <= 0, the function
-       returns a zero Series (aligned with ``hourly_u7.index``) and a
-       capacity of 0.0 kW.
-
-    3. Build the solar resource data from ResStock weather:
-
-        - Construct the ResStock weather CSV path (or URL) using
-          :func:`build_weather_path` with ``metadata_row["in.state"]``,
-          ``metadata_row["in.county"]``, and ``weather_base_prefix``.
-
-        - If the resulting path is an HTTP(S) URL, download it to a
-          temporary local CSV file using :func:`download_to_temp`.
-
-        - Read the CSV and build a
-          ``solar_resource_data`` dictionary via
-          :func:`build_solar_resource_from_resstock_csv`, using:
-
-              * Latitude  = ``metadata_row["in.weather_file_latitude"]``
-              * Longitude = ``metadata_row["in.weather_file_longitude"]``
-              * Optional time zone and elevation if present in metadata.
-
-        - Assign ``pv.SolarResource.solar_resource_data = solar_resource_data``.
-
-          Note that we **do not** use ``solar_resource_file`` here,
-          because the ResStock CSV is not in SAM’s native weather
-          format, and PVWatts requires latitude and longitude when using
-          custom resource data.
-
-    4. Configure and run PVWatts:
-
-        - Create a default Pvwattsv8 object (e.g. "PVWattsSingleOwner").
-        - Set:
-
-              * ``pv.SolarResource.solar_resource_data``
-              * ``pv.SystemDesign.system_capacity``
-              * ``pv.SystemDesign.azimuth``
-              * ``pv.SystemDesign.tilt``
-              * ``pv.SystemDesign.dc_ac_ratio``
-              * ``pv.SystemDesign.gcr``
-
-        - Call ``pv.execute()``.
-
-        The output ``pv.Outputs.ac`` is an array of hourly AC power in
-        kW. Because the timestep is 1 hour, each value is interpreted
-        as kWh for that hour.
-
-        The function wraps this in a pandas Series and aligns the index
-        with ``hourly_u7.index``.
+    1. Array geometry: the roof plane chosen by
+       :func:`select_pv_roof_from_hpxml` if the HPXML can be read and has
+       pitched planes. Otherwise ``pv_config.tilt_default_deg`` and the front
+       or back of the house (``in.orientation`` or its opposite), whichever
+       faces closer to south, as for a gable roof.
+    2. Simulate a 1 kW system with :func:`simulate_pv_per_kw`.
+    3. Size the system with :func:`size_pv_system_kw` against
+       ``hourly_load_kwh`` and scale the 1 kW output to it.
 
     Parameters
     ----------
     metadata_row : pandas.Series
-        Single-row metadata for the building. Must contain:
-
-            - ``"in.state"``: two-letter state abbreviation or name.
-            - ``"in.county"``: county ID used in weather filenames.
-            - ``"in.orientation"``: ResStock orientation label.
-            - ``"out.params.roof_area_ft_2"``: roof area (ft²), for
-              roof-based sizing (0 if missing).
-            - ``"in.weather_file_latitude"``: latitude (deg).
-            - ``"in.weather_file_longitude"``: longitude (deg).
-
-        If present, the following are used to refine the solar resource:
-
-            - ``"in.weather_file_time_zone"``: timezone offset from GMT.
-            - ``"in.weather_file_elevation"``: elevation (m).
-
-    hourly_u7 : pandas.Series
-        Hourly electric load (kWh) for Upgrade 7 (heat pump scenario),
-        indexed by hour (DatetimeIndex or similar).
-
+        ResStock metadata for the building: ``in.state``, ``in.county``,
+        ``in.orientation``, ``out.params.roof_area_ft_2``,
+        ``in.weather_file_latitude`` and ``in.weather_file_longitude``.
+    hourly_load_kwh : pandas.Series
+        Hourly electric load (kWh) the system is sized against, indexed by hour.
     pv_config : PVSimulationConfig
-        Configuration for PV sizing and PVWatts parameters.
-
+        PV sizing and PVWatts settings.
     weather_base_prefix : str
         Base path or URL to the ResStock weather directory.
-
     hpxml_zip_path : str, optional
-        Local path or HTTP(S) URL to the HPXML zip for this building
-        (typically upgrade 0). If provided, HPXML is used to infer tilt
-        and azimuth where possible.
+        Local path or URL to the building's HPXML zip, used for roof geometry.
 
     Returns
     -------
     (pv_kwh, system_capacity_kw) : (pandas.Series, float)
-        pv_kwh :
-            Hourly PV generation in kWh, aligned to ``hourly_u7.index``.
-        system_capacity_kw :
-            DC system capacity (kW) used in the PVWatts simulation.
-
-    Raises
-    ------
-    RuntimeError
-        If PySAM.Pvwattsv8 is not available.
-    ValueError
-        If an invalid sizing mode is specified.
+        Hourly PV generation (kWh) aligned to ``hourly_load_kwh.index``, and
+        the DC system size (kW).
     """
-    if Pvwatts is None:
-        raise RuntimeError(
-            "PySAM.Pvwattsv8 is not available. Install PySAM before "
-            "calling compute_pv_for_building."
-        )
-
     # ------------------------------------------------------------------
     # 1. Determine tilt and azimuth: HPXML if available, else orientation
     # ------------------------------------------------------------------
@@ -1268,32 +1124,22 @@ def compute_pv_for_building(
     # 3. Size the system and scale the 1 kW output to it
     # ------------------------------------------------------------------
     system_capacity_kw = size_pv_system_kw(
-        metadata_row, hourly_u7, pv_config, yield_kwh_per_kw=float(ac_kw_per_kw.sum())
+        metadata_row, hourly_load_kwh, pv_config, yield_kwh_per_kw=float(ac_kw_per_kw.sum())
     )
     ac_kw = ac_kw_per_kw * system_capacity_kw
     n_pv = len(ac_kw)
-    n_load = len(hourly_u7)
+    n_load = len(hourly_load_kwh)
+    load_index = hourly_load_kwh.index
 
-    # Work on a local copy of the load index so we don't mutate the caller's Series
-    load_index = hourly_u7.index
+    # ResStock's interval-ending timestamps give 8,761 hourly buckets for 8,760
+    # weather hours; the last (partial) hour gets no PV
+    if n_load == n_pv + 1:
+        load_index = load_index[:n_pv]
+    elif n_pv == n_load + 1:
+        ac_kw = ac_kw.iloc[:n_load]
+    elif n_pv != n_load:
+        raise ValueError(f"PVWatts output length {n_pv} does not match load length {n_load}")
 
-    if n_pv != n_load:
-        # Case 1: load has one extra hour (your observed case)
-        if n_load == n_pv + 1:
-            # Drop the last hour from the load for alignment
-            load_index = load_index[:n_pv]
-
-        # Case 2 (less common): PV has one extra hour
-        elif n_pv == n_load + 1:
-            ac_kw = ac_kw.iloc[:n_load]
-
-        else:
-            raise ValueError(
-                f"PVWatts AC output length {n_pv} does not match load length {n_load} "
-                "and cannot be trivially aligned (difference != 1)."
-            )
-
-    # Align the PV series to the (possibly trimmed) load index
     ac_kw.index = load_index
 
     return ac_kw, system_capacity_kw
@@ -1304,7 +1150,7 @@ def compute_pv_for_buildings(
     metadata_df: pd.DataFrame,
     pv_config: PVSimulationConfig,
     weather_base_prefix: str,
-    hp_upgrade: str = "7",
+    hp_upgrade: str = "2",
     hpxml_upgrade: str = "0",
     max_workers: int = 16,
     metadata_id_col: str = "bldg_id",
@@ -1331,7 +1177,7 @@ def compute_pv_for_buildings(
         Base URL for ResStock TMY3 weather files.
     hp_upgrade : str, optional
         Upgrade whose hourly load is used for load-based sizing.
-        Defaults to "7".
+        Defaults to "2".
     hpxml_upgrade : str, optional
         Upgrade whose HPXML is used for roof geometry. Defaults to "0".
     max_workers : int, optional
@@ -1352,7 +1198,7 @@ def compute_pv_for_buildings(
         hourly_load = grp.sort_values("ts_hour").set_index("ts_hour")["elec_kwh"]
         pv_kwh, system_kw = compute_pv_for_building(
             metadata_row=meta_by_id.loc[bldg_id],
-            hourly_u7=hourly_load,
+            hourly_load_kwh=hourly_load,
             pv_config=pv_config,
             weather_base_prefix=weather_base_prefix,
             hpxml_zip_path=build_hpxml_zip_path(bldg_id, upgrade=hpxml_upgrade),
@@ -1477,11 +1323,11 @@ def compute_annual_flows(
     battery_kw: float = 5.0,
     round_trip_efficiency: float = 0.90,
     baseline_upgrade: str = "0",
-    hp_upgrade: str = "7",
+    hp_upgrade: str = "2",
     metadata_id_col: str = "bldg_id",
 ) -> pd.DataFrame:
     """
-    Annual grid imports, exports and wholesale export value for each building
+    Annual energy use, grid imports, exports and wholesale export value for each building
     under four setups: with and without a heat pump, each with and without a
     battery.
 
@@ -1515,22 +1361,28 @@ def compute_annual_flows(
     round_trip_efficiency : float, optional
         Battery round-trip efficiency. Defaults to 0.90.
     baseline_upgrade, hp_upgrade : str, optional
-        Upgrade labels. Defaults to "0" and "7".
+        Upgrade labels. Defaults to "0" and "2".
     metadata_id_col : str, optional
         Column in metadata_df corresponding to bldg_id.
 
     Returns
     -------
     pandas.DataFrame
-        One row per building with ``bldg_id``, ``system_kw_solar_only`` and,
-        for each setup ``{hp, no_hp}_{no_batt, batt}``, columns
-        ``<setup>_import_kwh``, ``<setup>_export_kwh`` and
-        ``<setup>_export_wholesale_usd``. Buildings whose county has no
-        wholesale series get NaN wholesale values.
+        One row per building with:
+            - ``elec_base_kwh``, ``elec_hp_kwh``: annual electricity use
+              without and with the heat pump
+            - ``gas_base_kwh``, ``gas_hp_kwh``: annual gas use (kWh)
+            - ``system_kw``, ``system_kw_solar_only``: PV size with and
+              without the heat pump
+            - ``pv_kwh_per_kw``: annual simulated output per kW-dc
+            - for each setup ``{hp, no_hp}_{no_batt, batt}``:
+              ``<setup>_import_kwh``, ``<setup>_export_kwh`` and
+              ``<setup>_export_wholesale_usd``
+        Buildings whose county has no wholesale series get NaN wholesale values.
     """
-    def load_matrix(upgrade: str) -> pd.DataFrame:
+    def load_matrix(upgrade: str, column: str = "elec_kwh") -> pd.DataFrame:
         df = hourly_df[hourly_df["upgrade"] == upgrade]
-        mat = df.pivot_table(index=df["bldg_id"].astype(str), columns="ts_hour", values="elec_kwh", aggfunc="sum")
+        mat = df.pivot_table(index=df["bldg_id"].astype(str), columns="ts_hour", values=column, aggfunc="sum")
         return mat.sort_index(axis=1)
 
     pv = pv_df.copy()
@@ -1569,7 +1421,16 @@ def compute_annual_flows(
     if has_rates.any():
         price[has_rates] = wholesale_rates[fips[has_rates].tolist()].to_numpy().T
 
-    out = pd.DataFrame({"bldg_id": ids, "system_kw_solar_only": system_kw_solar_only})
+    out = pd.DataFrame({
+        "bldg_id": ids,
+        "elec_base_kwh": base_all.sum(axis=1).to_numpy(),
+        "elec_hp_kwh": hp_all.sum(axis=1).to_numpy(),
+        "gas_base_kwh": load_matrix(baseline_upgrade, "gas_kwh").loc[ids].sum(axis=1).to_numpy(),
+        "gas_hp_kwh": load_matrix(hp_upgrade, "gas_kwh").loc[ids].sum(axis=1).to_numpy(),
+        "system_kw": system_kw,
+        "system_kw_solar_only": system_kw_solar_only,
+        "pv_kwh_per_kw": yield_kwh_per_kw,
+    })
     setups = {
         "hp": (hp, pv_per_kw * system_kw[:, None], hp_extra),
         "no_hp": (base, pv_per_kw * system_kw_solar_only[:, None], base_extra),
@@ -1599,7 +1460,7 @@ def compute_plugin_solar(
     azimuth_deg: float = 180.0,
     array_type: int = 0,
     dc_ac_ratio: float = 1.2,
-    upgrade: str = "7",
+    upgrade: str = "2",
     max_workers: int = 16,
     metadata_id_col: str = "bldg_id",
 ) -> pd.DataFrame:
@@ -1630,7 +1491,7 @@ def compute_plugin_solar(
     dc_ac_ratio : float, optional
         DC/AC ratio. Defaults to 1.2.
     upgrade : str, optional
-        Upgrade whose hourly load the system offsets. Defaults to "7".
+        Upgrade whose hourly load the system offsets. Defaults to "2".
     max_workers : int, optional
         Number of worker threads. Defaults to 16.
     metadata_id_col : str, optional
@@ -1763,8 +1624,7 @@ def solar_annual_cost_per_kw(
     inflation_rate: float = 0.025,
     loan_term_years: int = 20,
     lifetime_years: int = 25,
-    degradation_rate: float = 0.005,
-    om_per_kw_year: float = 25.0,
+    om_per_kw_year: float = 0.0,
 ) -> float:
     """
     Yearly cost of a debt-financed residential PV system ($/kW-dc per year,
@@ -1795,11 +1655,8 @@ def solar_annual_cost_per_kw(
         Loan term in years. Defaults to 20.
     lifetime_years : int, optional
         System economic lifetime in years. Defaults to 25.
-    degradation_rate : float, optional
-        Annual output degradation. Unused; accepted so the same financing
-        assumptions can be passed to this function and :func:`solar_lcoe`.
     om_per_kw_year : float, optional
-        Fixed O&M in today's dollars ($/kW-yr). Defaults to 25.0.
+        Fixed O&M in today's dollars ($/kW-yr). Defaults to 0.
 
     Returns
     -------
@@ -1810,590 +1667,3 @@ def solar_annual_cost_per_kw(
         cost_per_w * 1000.0, debt_fraction, interest_rate, discount_rate,
         inflation_rate, loan_term_years, lifetime_years, om_per_kw_year,
     )
-
-
-def solar_lcoe(
-    cost_per_w: float,
-    annual_yield_kwh_per_kw: float | np.ndarray | pd.Series,
-    debt_fraction: float = 0.70,
-    interest_rate: float = 0.07,
-    discount_rate: float = 0.05,
-    inflation_rate: float = 0.025,
-    loan_term_years: int = 20,
-    lifetime_years: int = 25,
-    degradation_rate: float = 0.005,
-    om_per_kw_year: float = 25.0,
-) -> float | np.ndarray | pd.Series:
-    """
-    Real levelized cost of energy ($/kWh, today's dollars) for a debt-financed
-    residential PV system: the present value of what the homeowner pays,
-    divided by the present value of the system's (degrading) lifetime output.
-
-        LCOE = PV_nominal(costs) / PV_real(energy)
-
-    Comparable to today's retail electricity rates if those rates rise with
-    inflation. Parameters match :func:`solar_annual_cost_per_kw`, plus:
-
-    Parameters
-    ----------
-    annual_yield_kwh_per_kw : float, array or Series
-        First-year AC output per kW-dc of capacity (kWh/kW-yr).
-
-    Returns
-    -------
-    float, array or Series
-        Real LCOE in $/kWh, matching the shape of ``annual_yield_kwh_per_kw``.
-    """
-    pv_costs = _financed_present_value(
-        cost_per_w * 1000.0, debt_fraction, interest_rate, discount_rate,
-        inflation_rate, loan_term_years, lifetime_years, om_per_kw_year,
-    )
-    real_rate = (1 + discount_rate) / (1 + inflation_rate) - 1
-    years = np.arange(1, lifetime_years + 1)
-    pv_energy_per_kwh_yield = np.sum((1 - degradation_rate) ** (years - 1) / (1 + real_rate) ** years)
-
-    return pv_costs / (annual_yield_kwh_per_kw * pv_energy_per_kwh_yield)
-
-
-# =============================================================================
-# Billing calculations
-# =============================================================================
-
-
-def compute_annual_electric_bill(
-    annual_kwh: float,
-    fixed_charge_monthly: float,
-    marginal_rate_per_kwh: float,
-    annual_export_kwh: float = 0.0,
-    export_rate_per_kwh: float = 0.0,
-) -> float:
-    """
-    Compute an annual electric bill in dollars for a single building.
-
-    This function assumes a simple flat volumetric tariff with:
-        - A fixed monthly charge ($/month).
-        - A constant marginal energy rate ($/kWh).
-        - An optional export credit for PV exports ($/kWh).
-
-    Parameters
-    ----------
-    annual_kwh : float
-        Annual electric consumption in kWh (net of PV if modeling a
-        net-load case).
-    fixed_charge_monthly : float
-        Fixed electric charge per month ($/month).
-    marginal_rate_per_kwh : float
-        Volumetric electric rate applied to consumption ($/kWh).
-    annual_export_kwh : float, optional
-        Annual exported PV energy in kWh. Defaults to 0.0. This is used
-        to compute an export credit at ``export_rate_per_kwh``.
-    export_rate_per_kwh : float, optional
-        Credit rate for exported energy ($/kWh). Defaults to 0.0.
-
-    Returns
-    -------
-    float
-        Annual electric bill in dollars.
-
-    Notes
-    -----
-    The bill is computed as:
-
-        bill = fixed_charge_monthly * 12
-               + annual_kwh * marginal_rate_per_kwh
-               - annual_export_kwh * export_rate_per_kwh
-    """
-    annual_kwh = float(annual_kwh)
-    annual_export_kwh = float(annual_export_kwh)
-
-    fixed_charge = fixed_charge_monthly * 12.0
-    energy_charge = annual_kwh * marginal_rate_per_kwh
-    export_credit = annual_export_kwh * export_rate_per_kwh
-
-    return fixed_charge + energy_charge - export_credit
-
-
-def compute_annual_gas_bill(
-    annual_gas_kwh: float,
-    fixed_charge_monthly: float,
-    marginal_rate_per_kwh: float,
-) -> float:
-    """
-    Compute an annual natural gas bill in dollars for a single building.
-
-    This function assumes a simple flat volumetric tariff with:
-        - A fixed monthly charge ($/month).
-        - A constant marginal energy rate ($/kWh).
-
-    Parameters
-    ----------
-    annual_gas_kwh : float
-        Annual gas consumption in kWh.
-    fixed_charge_monthly : float
-        Fixed natural gas charge per month ($/month).
-    marginal_rate_per_kwh : float
-        Volumetric natural gas rate ($/kWh).
-
-    Returns
-    -------
-    float
-        Annual natural gas bill in dollars.
-
-    Notes
-    -----
-    The bill is computed as:
-
-        bill = fixed_charge_monthly * 12
-               + annual_gas_kwh * marginal_rate_per_kwh
-    """
-    annual_gas_kwh = float(annual_gas_kwh)
-
-    fixed_charge = fixed_charge_monthly * 12.0
-    energy_charge = annual_gas_kwh * marginal_rate_per_kwh
-
-    return fixed_charge + energy_charge
-
-
-def compute_bills_for_buildings(
-    hourly_df: pd.DataFrame,
-    metadata_df: pd.DataFrame,
-    pv_df: pd.DataFrame,
-    export_rate_per_kwh: float = 0.0,
-    baseline_upgrade: str = "0",
-    hp_upgrade: str = "7",
-    metadata_id_col: str = "bldg_id",
-) -> pd.DataFrame:
-    """
-    Compute annual bills and bill savings for baseline, solar-only,
-    heat pump-only, and heat pump+PV for a set of buildings.
-
-    Cases
-    -----
-    1) Baseline (Upgrade 0):
-       - bill_baseline
-
-    2) Solar only (Upgrade 0 + PV):
-       - bill_solar_only
-       - savings_solar_only = bill_baseline - bill_solar_only
-
-    3) Heat pump only (Upgrade 7):
-       - bill_hp
-       - savings_hp = bill_baseline - bill_hp
-
-    4) Heat pump + PV (Upgrade 7 + PV):
-       - bill_hp_pv
-       - savings_hp_pv = bill_baseline - bill_hp_pv
-
-    Notes
-    -----
-    - PV is applied to electricity only via hourly netting:
-        net_elec_kwh  = max(load_kwh - pv_kwh, 0)
-        export_kwh    = max(pv_kwh - load_kwh, 0)
-
-    - Gas rates in ResStock metadata are in $/therm and are converted
-      internally to $/kWh using 1 therm = 29.3 kWh.
-
-    Parameters
-    ----------
-    hourly_df : pandas.DataFrame
-        Output of build_building_hourly_profiles.
-    metadata_df : pandas.DataFrame
-        ResStock metadata including tariff columns.
-    pv_df : pandas.DataFrame
-        Hourly PV generation with columns ['bldg_id', 'ts_hour', 'pv_kwh'].
-        (May also include 'system_kw' or other columns; they are ignored.)
-    export_rate_per_kwh : float, optional
-        Export credit rate ($/kWh) applied to annual exports.
-    baseline_upgrade : str, optional
-        Baseline upgrade label, default "0".
-    hp_upgrade : str, optional
-        Heat pump upgrade label, default "7".
-    metadata_id_col : str, optional
-        Column in metadata_df corresponding to bldg_id.
-
-    Returns
-    -------
-    pandas.DataFrame
-        Per-building bills and savings including solar-only metrics.
-    """
-    hourly_df = hourly_df.copy()
-    metadata_df = metadata_df.copy()
-    pv_df = pv_df.copy()
-
-    # Ensure IDs are strings
-    hourly_df["bldg_id"] = hourly_df["bldg_id"].astype(str)
-    pv_df["bldg_id"] = pv_df["bldg_id"].astype(str)
-    metadata_df[metadata_id_col] = metadata_df[metadata_id_col].astype(str)
-
-    # Ensure ts_hour is datetime for merges
-    if "ts_hour" in hourly_df.columns:
-        hourly_df["ts_hour"] = pd.to_datetime(hourly_df["ts_hour"])
-    if "ts_hour" in pv_df.columns:
-        pv_df["ts_hour"] = pd.to_datetime(pv_df["ts_hour"])
-
-    # Split hourly profiles
-    hourly_baseline = hourly_df[hourly_df["upgrade"] == baseline_upgrade]
-    hourly_hp = hourly_df[hourly_df["upgrade"] == hp_upgrade]
-
-    # Annual baseline and HP energy
-    agg_baseline = (
-        hourly_baseline.groupby("bldg_id")
-        .agg(
-            annual_elec_0_kwh=("elec_kwh", "sum"),
-            annual_gas_0_kwh=("gas_kwh", "sum"),
-            city=("in.city", "first"),
-            state=("in.state", "first"),
-            county=("in.county", "first"),
-        )
-        .reset_index()
-    )
-
-    agg_hp = (
-        hourly_hp.groupby("bldg_id")
-        .agg(
-            annual_elec_7_kwh=("elec_kwh", "sum"),
-            annual_gas_7_kwh=("gas_kwh", "sum"),
-        )
-        .reset_index()
-    )
-
-    annual = pd.merge(agg_baseline, agg_hp, on="bldg_id", how="inner")
-
-    # ---- Solar-only (baseline + PV) hourly netting ----
-    base_with_pv = pd.merge(
-        hourly_baseline[["bldg_id", "ts_hour", "elec_kwh"]],
-        pv_df[["bldg_id", "ts_hour", "pv_kwh"]],
-        on=["bldg_id", "ts_hour"],
-        how="left",
-    )
-    base_with_pv["pv_kwh"] = base_with_pv["pv_kwh"].fillna(0.0)
-
-    base_with_pv["net_elec_kwh"] = (base_with_pv["elec_kwh"] - base_with_pv["pv_kwh"]).clip(lower=0.0)
-    base_with_pv["export_kwh"] = (base_with_pv["pv_kwh"] - base_with_pv["elec_kwh"]).clip(lower=0.0)
-
-    agg_base_pv = (
-        base_with_pv.groupby("bldg_id")
-        .agg(
-            annual_elec_0_net_kwh=("net_elec_kwh", "sum"),
-            annual_exports_0_kwh=("export_kwh", "sum"),
-        )
-        .reset_index()
-    )
-    annual = pd.merge(annual, agg_base_pv, on="bldg_id", how="left")
-    annual["annual_elec_0_net_kwh"] = annual["annual_elec_0_net_kwh"].fillna(annual["annual_elec_0_kwh"])
-    annual["annual_exports_0_kwh"] = annual["annual_exports_0_kwh"].fillna(0.0)
-
-    # ---- HP + PV hourly netting ----
-    hp_with_pv = pd.merge(
-        hourly_hp[["bldg_id", "ts_hour", "elec_kwh"]],
-        pv_df[["bldg_id", "ts_hour", "pv_kwh"]],
-        on=["bldg_id", "ts_hour"],
-        how="left",
-    )
-    hp_with_pv["pv_kwh"] = hp_with_pv["pv_kwh"].fillna(0.0)
-
-    hp_with_pv["net_elec_kwh"] = (hp_with_pv["elec_kwh"] - hp_with_pv["pv_kwh"]).clip(lower=0.0)
-    hp_with_pv["export_kwh"] = (hp_with_pv["pv_kwh"] - hp_with_pv["elec_kwh"]).clip(lower=0.0)
-
-    agg_hp_pv = (
-        hp_with_pv.groupby("bldg_id")
-        .agg(
-            annual_elec_7_net_kwh=("net_elec_kwh", "sum"),
-            annual_exports_kwh=("export_kwh", "sum"),
-        )
-        .reset_index()
-    )
-
-    annual = pd.merge(annual, agg_hp_pv, on="bldg_id", how="left")
-    annual["annual_elec_7_net_kwh"] = annual["annual_elec_7_net_kwh"].fillna(annual["annual_elec_7_kwh"])
-    annual["annual_exports_kwh"] = annual["annual_exports_kwh"].fillna(0.0)
-
-    # Tariffs
-    meta_cols = [
-        metadata_id_col,
-        "in.utility_bill_electricity_fixed_charges",
-        "in.utility_bill_electricity_marginal_rates",
-        "in.utility_bill_natural_gas_fixed_charges",
-        "in.utility_bill_natural_gas_marginal_rates",
-    ]
-    missing_meta = [c for c in meta_cols if c not in metadata_df.columns]
-    if missing_meta:
-        raise KeyError(f"metadata_df is missing required tariff columns: {missing_meta}")
-
-    meta_tariffs = metadata_df[meta_cols].copy()
-    meta_tariffs = meta_tariffs.rename(columns={metadata_id_col: "bldg_id"})
-    meta_tariffs["bldg_id"] = meta_tariffs["bldg_id"].astype(str)
-    annual = pd.merge(annual, meta_tariffs, on="bldg_id", how="left")
-
-    # Bills per building
-    records: list[dict[str, Any]] = []
-    for _, row in annual.iterrows():
-        bid = row["bldg_id"]
-
-        elec_fixed = float(row["in.utility_bill_electricity_fixed_charges"])
-        elec_rate = float(row["in.utility_bill_electricity_marginal_rates"])
-
-        gas_fixed = float(row["in.utility_bill_natural_gas_fixed_charges"])
-        gas_rate_therm = float(row["in.utility_bill_natural_gas_marginal_rates"])
-        gas_rate = gas_rate_therm / 29.3  # $/therm -> $/kWh
-
-        # Energies
-        annual_elec_0 = float(row["annual_elec_0_kwh"])
-        annual_gas_0 = float(row["annual_gas_0_kwh"])
-
-        annual_elec_0_net = float(row["annual_elec_0_net_kwh"])
-        annual_exports_0 = float(row["annual_exports_0_kwh"])
-
-        annual_elec_7 = float(row["annual_elec_7_kwh"])
-        annual_gas_7 = float(row["annual_gas_7_kwh"])
-
-        annual_elec_7_net = float(row["annual_elec_7_net_kwh"])
-        annual_exports_7 = float(row["annual_exports_kwh"])
-
-        # Baseline
-        bill_ele_0 = compute_annual_electric_bill(
-            annual_kwh=annual_elec_0,
-            fixed_charge_monthly=elec_fixed,
-            marginal_rate_per_kwh=elec_rate,
-        )
-        bill_gas_0 = compute_annual_gas_bill(
-            annual_gas_kwh=annual_gas_0,
-            fixed_charge_monthly=gas_fixed,
-            marginal_rate_per_kwh=gas_rate,
-        )
-        bill_baseline = bill_ele_0 + bill_gas_0
-
-        # Solar only (baseline + PV)
-        bill_ele_0_pv = compute_annual_electric_bill(
-            annual_kwh=annual_elec_0_net,
-            fixed_charge_monthly=elec_fixed,
-            marginal_rate_per_kwh=elec_rate,
-            annual_export_kwh=annual_exports_0,
-            export_rate_per_kwh=export_rate_per_kwh,
-        )
-        bill_solar_only = bill_ele_0_pv + bill_gas_0
-
-        # Heat pump only
-        bill_ele_7 = compute_annual_electric_bill(
-            annual_kwh=annual_elec_7,
-            fixed_charge_monthly=elec_fixed,
-            marginal_rate_per_kwh=elec_rate,
-        )
-        bill_gas_7 = compute_annual_gas_bill(
-            annual_gas_kwh=annual_gas_7,
-            fixed_charge_monthly=gas_fixed,
-            marginal_rate_per_kwh=gas_rate,
-        )
-        bill_hp = bill_ele_7 + bill_gas_7
-
-        # Heat pump + PV
-        bill_ele_7_pv = compute_annual_electric_bill(
-            annual_kwh=annual_elec_7_net,
-            fixed_charge_monthly=elec_fixed,
-            marginal_rate_per_kwh=elec_rate,
-            annual_export_kwh=annual_exports_7,
-            export_rate_per_kwh=export_rate_per_kwh,
-        )
-        bill_hp_pv = bill_ele_7_pv + bill_gas_7
-
-        records.append(
-            {
-                "bldg_id": bid,
-                "in.city": row["city"],
-                "in.state": row["state"],
-                "in.county": row["county"],
-
-                "bill_baseline": bill_baseline,
-                "bill_solar_only": bill_solar_only,
-                "bill_hp": bill_hp,
-                "bill_hp_pv": bill_hp_pv,
-
-                "savings_solar_only": bill_baseline - bill_solar_only,
-                "savings_hp": bill_baseline - bill_hp,
-                "savings_hp_pv": bill_baseline - bill_hp_pv,
-
-                "annual_elec_0_kwh": annual_elec_0,
-                "annual_elec_0_net_kwh": annual_elec_0_net,
-                "annual_exports_0_kwh": annual_exports_0,
-
-                "annual_elec_7_kwh": annual_elec_7,
-                "annual_elec_7_net_kwh": annual_elec_7_net,
-                "annual_exports_kwh": annual_exports_7,
-
-                "annual_gas_0_kwh": annual_gas_0,
-                "annual_gas_7_kwh": annual_gas_7,
-            }
-        )
-
-    return pd.DataFrame.from_records(records)
-
-
-# =============================================================================
-# Plotting: grouped bar by city with 95% CI
-# =============================================================================
-
-
-def _summarize_city_savings(
-    results_df: pd.DataFrame,
-    n_boot: int = 1000,
-    ci: float = 0.95,
-    random_seed: int = 0,
-) -> pd.DataFrame:
-    """
-    Compute median savings and bootstrap confidence intervals by city for:
-      - Solar only
-      - Heat pump only
-      - Heat pump + solar
-
-    Parameters
-    ----------
-    results_df : pandas.DataFrame
-        DataFrame with at least:
-            - "in.city"
-            - "savings_solar_only"
-            - "savings_hp"
-            - "savings_hp_pv"
-    n_boot : int, optional
-        Number of bootstrap resamples per city (default 1000).
-    ci : float, optional
-        Central confidence level (default 0.95). Uses the percentile
-        bootstrap interval.
-    random_seed : int, optional
-        Seed for reproducibility (default 0).
-
-    Returns
-    -------
-    pandas.DataFrame
-        One row per city with:
-            - in.city
-            - median_savings_solar_only, ci_savings_solar_only
-            - median_savings_hp,         ci_savings_hp
-            - median_savings_hp_pv,      ci_savings_hp_pv
-
-    Notes
-    -----
-    Confidence intervals are bootstrap percentile intervals around the median.
-    The returned ``ci_*`` values are half-widths (median minus lower bound or
-    upper bound minus median, whichever is larger), suitable for symmetric
-    error bars.
-    """
-    rng = np.random.default_rng(random_seed)
-    alpha = (1.0 - ci) / 2.0
-    lo_q = 100.0 * alpha
-    hi_q = 100.0 * (1.0 - alpha)
-
-    def median_ci_halfwidth(values: np.ndarray) -> Tuple[float, float]:
-        values = values.astype(float)
-        values = values[~np.isnan(values)]
-        if values.size == 0:
-            return (np.nan, np.nan)
-        med = float(np.median(values))
-        if values.size == 1:
-            return (med, 0.0)
-
-        boots = np.empty(n_boot, dtype=float)
-        n = values.size
-        for i in range(n_boot):
-            sample = rng.choice(values, size=n, replace=True)
-            boots[i] = np.median(sample)
-
-        lo = float(np.percentile(boots, lo_q))
-        hi = float(np.percentile(boots, hi_q))
-        halfwidth = max(med - lo, hi - med)
-        return (med, halfwidth)
-
-    rows = []
-    for city, g in results_df.groupby("in.city"):
-        m_solar, ci_solar = median_ci_halfwidth(g["savings_solar_only"].to_numpy())
-        m_hp, ci_hp = median_ci_halfwidth(g["savings_hp"].to_numpy())
-        m_hp_pv, ci_hp_pv = median_ci_halfwidth(g["savings_hp_pv"].to_numpy())
-
-        rows.append(
-            {
-                "in.city": city,
-                "median_savings_solar_only": m_solar,
-                "ci_savings_solar_only": ci_solar,
-                "median_savings_hp": m_hp,
-                "ci_savings_hp": ci_hp,
-                "median_savings_hp_pv": m_hp_pv,
-                "ci_savings_hp_pv": ci_hp_pv,
-                "n": int(len(g)),
-            }
-        )
-
-    return pd.DataFrame(rows)
-
-
-def plot_city_bill_savings(
-    results_df: pd.DataFrame,
-    cities: Sequence[str],
-    figsize: Tuple[int, int] = (11, 6),
-    n_boot: int = 1000,
-    ci: float = 0.95,
-    random_seed: int = 0,
-) -> None:
-    """
-    Grouped bar plot by city showing median annual bill savings for:
-        - Heat pump only
-        - Heat pump + solar
-        - Solar only
-
-    Includes bootstrap confidence intervals (default 95%) as error bars.
-
-    Cities are filtered to `cities` and ordered by highest to lowest
-    median heat pump + solar savings.
-    """
-    df = results_df[results_df["in.city"].isin(cities)].copy()
-    if df.empty:
-        raise ValueError("No buildings found for the specified cities.")
-
-    summary = _summarize_city_savings(
-        df, n_boot=n_boot, ci=ci, random_seed=random_seed
-    )
-
-    # Order cities by HP + PV savings (descending)
-    summary = summary.sort_values(
-        "median_savings_hp_pv", ascending=False
-    ).reset_index(drop=True)
-
-    x = np.arange(len(summary))
-    width = 0.25
-
-    fig, ax = plt.subplots(figsize=figsize)
-
-    # ---- Bar order: HP | HP + PV | Solar only ----
-    ax.bar(
-        x - width,
-        summary["median_savings_hp"],
-        width,
-        #yerr=summary["ci_savings_hp"],
-        capsize=4,
-        label="Heat pump only",
-    )
-    ax.bar(
-        x,
-        summary["median_savings_hp_pv"],
-        width,
-        #yerr=summary["ci_savings_hp_pv"],
-        capsize=4,
-        label="Heat pump + solar",
-    )
-    ax.bar(
-        x + width,
-        summary["median_savings_solar_only"],
-        width,
-        #yerr=summary["ci_savings_solar_only"],
-        capsize=4,
-        label="Solar only",
-    )
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(summary["in.city"], rotation=45, ha="right")
-    ax.set_ylabel("Median Annual bill savings ($/year)")
-    ax.set_title(
-        "Bill savings by city: heat pump vs. heat pump + solar vs. solar"
-    )
-    ax.legend()
-    plt.tight_layout()
-    plt.show()
-

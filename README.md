@@ -178,12 +178,12 @@ The heat pump is ResStock Upgrade 2 (high-efficiency cold-climate heat pump with
 
 | Scenario | Current policy | Net metering phased out |
 |---|---|---|
-| Heat pump alone | 49%, −$17/yr | 49%, −$17/yr |
+| Heat pump on grid power | 49%, −$17/yr | 49%, −$17/yr |
 | + solar $3.62/W | 31%, −$376/yr | 6%, −$1,301/yr |
 | + solar $2/W | 77%, +$627/yr | 42%, −$147/yr |
 | + solar $1/W | 96%, +$1,282/yr | 82%, +$534/yr |
 
-Batteries ($1,200/$800/$400 per kWh with $3.62/$2/$1 per W solar) barely change result 1 and lower result 2 under current policy; with net metering phased out they recover a little of the lost value. See the notebook for all battery rows.
+Battery scenarios pair $1,200, $800 and $400/kWh with $3.62, $2 and $1/W solar; all rows are in the notebook and output CSVs.
 
 **3. Plug-in solar on a heat pump home** (national medians)
 
@@ -197,7 +197,7 @@ Batteries ($1,200/$800/$400 per kWh with $3.62/$2/$1 per W solar) barely change 
 ### Methodology
 
 #### Data sources
-1. **ResStock 2024 Release 2 metadata and annual results** (remote, OEDI data lake)
+1. **ResStock 2024 Release 2 (TMY3) metadata and annual results** (remote, OEDI data lake)
    - `load_resstock_metadata(...)` reads `metadata/upgradeNN.parquet` directly from S3 with filters pushed down to DuckDB.
    - Used for building selection, location, roof area, orientation, weather file coordinates and annual end-use energy.
 
@@ -229,7 +229,7 @@ Batteries ($1,200/$800/$400 per kWh with $3.62/$2/$1 per W solar) barely change 
    - `sizing_mode="min"` (`size_pv_system_kw(...)`): the smaller of roof-based size (`roof_area_ft2 * 15 W/ft2`) and load-based size (100% of annual load, using the home's simulated output per kW), capped at 25 kW (`max_system_kw`).
    - Homes size to their own load: with a heat pump, against the heat pump scenario's load (median 12.1 kW); without one, a smaller system against the baseline load (median 7.5 kW), scaling the same simulated profile.
 
-3. **Hourly netting** — `compute_annual_flows(...)` nets PV against hourly load for four setups (with/without a heat pump, each with/without a battery) and returns annual grid imports, exports, and exports valued at hourly wholesale prices. `simulate_battery(...)` dispatches a 13.5 kWh / 5 kW battery (90% round-trip) to store surplus solar for later use in the home; it never charges from the grid. `compute_bills_for_buildings(...)` is kept as a QA check.
+3. **Hourly netting** — `compute_annual_flows(...)` returns each home's annual electricity and gas use with and without the heat pump, and nets PV against hourly load for four setups (with/without a heat pump, each with/without a battery), returning annual grid imports, exports, and exports valued at hourly wholesale prices. `simulate_battery(...)` dispatches a 13.5 kWh / 5 kW battery (90% round-trip) to store surplus solar for later use in the home; it never charges from the grid. The notebook checks that, without a battery, imports − exports + solar output equals load.
 
 4. **Rates** — `build_state_residential_rates(...)` returns state marginal rates over the latest 12 months: average price with a fixed monthly customer charge removed (`(revenue - fixed * customer_months) / sales`; defaults $10/month electric, $11.25/month gas, matching ResStock). Fixed charges are paid in every scenario, so only marginal rates affect the comparisons.
 
@@ -255,7 +255,7 @@ Batches of 500 buildings are cached to `../data/solar_bill_national_sample_u{HP_
 - No equipment costs for the heat pump, no incentives, and no value for backup power.
 
 ### Outputs
-- **Per-building annual results** (`bills_df`, cached as CSV batches): annual electricity and gas use, system sizes, and annual imports/exports for each setup.
+- **Per-building annual results** (`annual` in the notebook, cached as CSV batches): annual electricity and gas use, system sizes, solar output per kW, annual imports/exports for each setup, and plug-in production and self-consumption.
 - `../outputs/heat_pump_running_cost_vs_gas.csv` — result 1, by scenario and export policy.
 - `../outputs/heat_pump_solar_overall_bills_vs_today.csv` — result 2, by scenario and export policy.
 - `../outputs/plugin_solar_with_heat_pump_by_state.csv` — result 3, nationally and by state.
