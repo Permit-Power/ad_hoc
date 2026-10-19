@@ -36,7 +36,7 @@ Current module–notebook pairs:
 | Module | Notebook(s) | Purpose |
 |---|---|---|
 | `build_hourly_load.py` | `nj_hourly_profiles.ipynb`, `co_hourly_profiles.ipynb`, `il_hourly_profiles.ipynb`, `ma_hourly_profiles.ipynb` | City-level median hourly electricity profiles from ResStock |
-| `solar_bill_analysis.py` | `solar_bill_analysis.ipynb` | Heat pump running costs vs. gas, with rooftop solar, batteries and plug-in solar (national ResStock sample) |
+| `solar_bill_analysis.py` | `solar_bill_analysis.ipynb`, `plugin_solar_penetration.ipynb` | Heat pump running costs vs. gas, with rooftop solar, batteries and plug-in solar; plug-in solar savings at 10% household adoption (national ResStock samples) |
 | `eia_rates.py` | `solar_bill_analysis.ipynb` | State marginal residential electricity and gas rates from EIA (fixed charges removed) |
 | `avoided_gas_capacity.py` | `avoided_gas_capacity.ipynb` | Natural gas displacement from increased solar adoption |
 

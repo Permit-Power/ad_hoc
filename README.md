@@ -494,3 +494,56 @@ Exploratory pull of Florida residential permits from the Shovels API (2026 YTD) 
 - Field inventory displayed inline — no file outputs (exploratory only)
 
 ---
+
+---
+
+## 12) Plug-in Solar at 10% Household Adoption (ResStock + PySAM + EIA)
+
+**Primary artifacts**
+- Notebook: `plugin_solar_penetration.ipynb`
+- Modules: `solar_bill_analysis.py` (`compute_plugin_solar`), `eia_rates.py`
+
+### Purpose
+Estimate bill savings from 391W and 1,200W plug-in solar systems across all U.S. households: per adopting household, and national and state totals if 10% of households adopt.
+
+### Key results (5,000-home run, October 2026)
+
+| | 391W | 1,200W |
+|---|---|---|
+| Bill savings per adopting household (mean) | $86/yr | $241/yr |
+| Share of output used (no export credit) | 100% | 92% |
+| Adopting households (10% of 121.9M) | 12.2M | 12.2M |
+| National annual savings | $1.06B (95% interval $1.055–1.069B) | $2.96B ($2.94–2.98B) |
+| National 10-year savings | $10.4B | $29.0B |
+| Annual electricity offset | 5.8 TWh | 16.3 TWh |
+
+Apartments with a vertical railing array save about 35–40% less than houses with a south-facing yard array ($59 vs. $93/yr at 391W; $160 vs. $260/yr at 1,200W). State totals are in the notebook and `../outputs/plugin_solar_10pct_adoption_by_state.csv`.
+
+### Methodology
+
+#### Data sources
+- **ResStock 2024 Release 2 (TMY3) baseline metadata and hourly electricity use** (remote, OEDI data lake), occupied units only. Uniform sample weights give household counts (121.9M occupied households in the lower 48 states and DC).
+- **ResStock TMY3 weather files** for PVWatts.
+- **EIA state marginal residential electricity rates** via `eia_rates.py` (latest 12 months, $10/month fixed charge removed).
+
+#### Key calculations
+1. **Sample:** 5,000 occupied housing units drawn at random (seed 42), all building types, tenures and heating fuels.
+2. **Mounting:**
+   - Single-family detached and attached homes and mobile homes: south-facing, 20° tilt (yard, patio or roof edge).
+   - Apartments (2–4 and 5+ units): vertical (90°) railing array on the back of the unit, at `in.orientation` + 180°. ResStock's `in.orientation` is the direction the unit's front faces the street, drawn from a national distribution (OpenStreetMap via Radiant Labs) with no dependence on location or building type; ResStock models apartments with an interior corridor at the front, so the exterior wall is at the back.
+   - PVWatts fixed open rack for all.
+3. **Self-consumption:** `compute_plugin_solar(...)` nets hourly output against the home's hourly electricity use; surplus is lost (no export compensation). Savings are used kWh at the state's marginal rate.
+4. **Adoption:** a random 10% of each state's households, drawn from homes that would adopt. ASSUMPTION: apartments whose balcony faces north, northeast or northwest (about a third of apartments) don't adopt.
+5. **Totals:** each state's adopting households × the mean savings of its sampled adopters; states are summed to the national total. The 95% interval comes from resampling homes within each state (1,000 draws).
+6. **10-year savings:** annual savings × 9.778, the sum of 0.5%/yr panel degradation over 10 years, holding the share of output used and today's electricity rates constant.
+
+#### Known limitations
+- No shading from neighboring buildings, trees or balconies above, so apartment output is likely overstated.
+- `in.orientation` is a statistical assignment, not each building's actual direction.
+- No system costs, incentives, or changes in electricity rates.
+- Alaska and Hawaii are not in ResStock.
+
+### Outputs
+- `../outputs/plugin_solar_per_household.csv` — result 1, by home type.
+- `../outputs/plugin_solar_10pct_adoption_national.csv` — result 2.
+- `../outputs/plugin_solar_10pct_adoption_by_state.csv` — result 3.

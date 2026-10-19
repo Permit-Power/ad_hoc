@@ -1458,6 +1458,7 @@ def compute_plugin_solar(
     sizes_kw: Sequence[float] = (0.391, 1.2),
     tilt_deg: float = 20.0,
     azimuth_deg: float = 180.0,
+    orientations: Optional[pd.DataFrame] = None,
     array_type: int = 0,
     dc_ac_ratio: float = 1.2,
     upgrade: str = "2",
@@ -1468,10 +1469,10 @@ def compute_plugin_solar(
     Annual production and self-consumption of small plug-in solar systems with
     no export compensation.
 
-    Each building gets a south-facing array at a fixed tilt (PVWatts defaults:
-    20°, fixed open rack), as plug-in panels typically sit on a balcony,
-    railing or yard rather than the roof. Each hour the home uses what it can
-    of the output; any surplus is lost.
+    By default each building gets a south-facing array at a 20° tilt (PVWatts
+    defaults, fixed open rack); ``orientations`` sets tilt and azimuth per
+    building instead. Each hour the home uses what it can of the output; any
+    surplus is lost.
 
     Parameters
     ----------
@@ -1485,7 +1486,10 @@ def compute_plugin_solar(
     sizes_kw : sequence of float, optional
         Plug-in system sizes in kW-dc. Defaults to (0.391, 1.2).
     tilt_deg, azimuth_deg : float, optional
-        Array tilt and azimuth. Defaults to 20° and 180° (south).
+        Array tilt and azimuth for every building. Defaults to 20° and 180°
+        (south). Ignored if ``orientations`` is given.
+    orientations : pandas.DataFrame, optional
+        Per-building ``bldg_id``, ``tilt_deg`` and ``azimuth_deg``.
     array_type : int, optional
         PVWatts array type. Defaults to 0 (fixed open rack).
     dc_ac_ratio : float, optional
@@ -1508,10 +1512,13 @@ def compute_plugin_solar(
     load = load.pivot_table(index=load["bldg_id"].astype(str), columns="ts_hour", values="elec_kwh", aggfunc="sum")
     load = load.sort_index(axis=1).iloc[:, :8760]
     meta_by_id = metadata_df.set_index(metadata_df[metadata_id_col].astype(str))
+    if orientations is not None:
+        geometry = orientations.set_index(orientations["bldg_id"].astype(str))[["tilt_deg", "azimuth_deg"]]
 
     def run_one(bid: str) -> Dict[str, float]:
+        tilt, azimuth = (tilt_deg, azimuth_deg) if orientations is None else geometry.loc[bid]
         per_kw = simulate_pv_per_kw(
-            meta_by_id.loc[bid], weather_base_prefix, tilt_deg, azimuth_deg, array_type, dc_ac_ratio
+            meta_by_id.loc[bid], weather_base_prefix, tilt, azimuth, array_type, dc_ac_ratio
         ).to_numpy()[:8760]
         home = load.loc[bid].to_numpy()
         row = {"bldg_id": bid}
